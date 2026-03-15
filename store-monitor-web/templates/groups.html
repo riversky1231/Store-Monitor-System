@@ -1,0 +1,330 @@
+{% extends "layout.html" %}
+{% block page_title %}监控任务{% endblock %}
+
+{% block topbar_extra %}
+<div style="display:flex;gap:8px;align-items:center">
+  <button class="btn btn-ghost" onclick="openM('importM')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" width="15" height="15">
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" stroke-linecap="round"/>
+      <polyline points="7 10 12 15 17 10" stroke-linecap="round" stroke-linejoin="round"/>
+      <line x1="12" y1="15" x2="12" y2="3" stroke-linecap="round"/>
+    </svg>
+    导入任务
+  </button>
+  <button class="btn btn-primary" onclick="openM('createM')">
+    <svg viewBox="0 0 24 24" fill="currentColor" width="15" height="15"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
+    创建分组
+  </button>
+  <form action="/tasks/run-all" method="post" style="display:inline"
+        onsubmit="return confirm('确认执行全部已启用的监控任务？\n全部完成后将发送一封综合报告。')">
+    <button type="submit" class="btn" style="background:#059669;color:#fff">
+      <svg viewBox="0 0 24 24" fill="currentColor" width="15" height="15"><path d="M8 5v14l11-7z"/></svg>
+      全部执行
+    </button>
+  </form>
+  <form action="/tasks/queue/stop" method="post" style="display:inline"
+        onsubmit="return confirm('确认强制停止当前运行中的任务和等待队列？\n这会中断当前抓取并清空队列。')">
+    <button type="submit" class="btn" style="background:#dc2626;color:#fff">
+      <svg viewBox="0 0 24 24" fill="currentColor" width="15" height="15"><path d="M6 6h12v12H6z"/></svg>
+      强制停止
+    </button>
+  </form>
+</div>
+{% endblock %}
+
+{% block content %}
+
+{% if request.query_params.get('run_all') %}
+<div class="alert alert-ok">已将 {{ request.query_params.get('queued') }} 个任务加入执行队列，全部完成后将发送一封综合报告邮件。</div>
+{% endif %}
+{% if request.query_params.get('queue_stopped') %}
+<div class="alert alert-info">
+  已强制停止运行队列，清空 {{ request.query_params.get('cleared') }} 个等待任务。
+  {% if request.query_params.get('running') %}
+  已尝试中断正在执行的任务（ID={{ request.query_params.get('running') }}）。
+  {% endif %}
+</div>
+{% endif %}
+{% if request.query_params.get('import_ok') %}
+<div class="alert alert-ok">
+  导入完成：
+  {% if request.query_params.get('groups') and request.query_params.get('groups') != '0' %}
+  创建了 <strong>{{ request.query_params.get('groups') }}</strong> 个分组，
+  {% endif %}
+  成功导入 <strong>{{ request.query_params.get('imported') }}</strong> 个店铺，跳过 {{ request.query_params.get('skipped') }} 个。
+  点击「全部执行」即可开始监控。
+</div>
+{% endif %}
+{% if request.query_params.get('pending_ok') %}
+<div class="alert alert-ok">
+  已从旧版数据库中读取 <strong>{{ request.query_params.get('pending') }}</strong> 个店铺到待分配列表，跳过 {{ request.query_params.get('skipped') }} 个。
+  请进入各分组，从待分配列表中勾选店铺进行分配。
+</div>
+{% endif %}
+{% if request.query_params.get('pending_cleared') %}
+<div class="alert alert-ok">已清空待分配列表。</div>
+{% endif %}
+{% if request.query_params.get('error') %}
+<div class="alert alert-err">{{ request.query_params.get('error') }}</div>
+{% endif %}
+
+{% if pending_count > 0 %}
+<div class="card" style="padding:14px 18px;margin-bottom:16px;border-left:4px solid #f59e0b;background:#fffbeb">
+  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+    <span style="font-size:14px;font-weight:600;color:#92400e">
+      <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16" style="vertical-align:-3px;margin-right:4px;color:#f59e0b">
+        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/>
+      </svg>
+      有 <strong>{{ pending_count }}</strong> 个待分配店铺 — 请进入分组后勾选导入
+    </span>
+    <form action="/tasks/clear-pending" method="post" style="display:inline"
+          onsubmit="return confirm('确认清空全部待分配店铺？此操作不可恢复。')">
+      <button type="submit" class="btn btn-ghost" style="font-size:12px;color:#dc2626">清空待分配</button>
+    </form>
+  </div>
+</div>
+{% endif %}
+
+<div class="card" style="padding:12px 16px;margin-bottom:16px">
+  <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <form class="search-form" method="get" action="/tasks" style="flex:1;min-width:180px">
+      <div class="search-wrap">
+        <svg class="search-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+          <circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="22" y2="22"/>
+        </svg>
+        <input type="text" name="search" class="inp search-inp" placeholder="搜索分组名称…" value="{{ search }}">
+      </div>
+      <button type="submit" class="btn btn-ghost">搜索</button>
+      {% if search %}
+      <a href="/tasks" class="btn btn-ghost">清除</a>
+      {% endif %}
+    </form>
+    <form class="search-form" method="get" action="/tasks/search-store" style="flex:1;min-width:180px">
+      <div class="search-wrap">
+        <svg class="search-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+          <circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="22" y2="22"/>
+        </svg>
+        <input type="text" name="q" class="inp search-inp" placeholder="搜索店铺名称，定位到所在分组…">
+      </div>
+      <button type="submit" class="btn btn-ghost">定位</button>
+    </form>
+  </div>
+</div>
+
+<!-- 运行队列 -->
+<div id="queuePanel" class="card" style="padding:12px 16px;margin-bottom:16px;display:none">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+    <span style="font-weight:700;font-size:14px;color:var(--text-main)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="15" height="15" style="vertical-align:-2px;margin-right:4px">
+        <path d="M12 2a10 10 0 0 1 10 10" stroke-linecap="round"><animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="1s" repeatCount="indefinite"/></path>
+      </svg>
+      运行队列 <span id="qTotal" style="font-weight:400;color:var(--text-sub)"></span>
+    </span>
+  </div>
+  <div id="qList" class="q-scroll"></div>
+</div>
+
+{% if groups %}
+<div class="group-grid">
+  {% for g in groups %}
+  <a href="/tasks/group/{{ g.id }}" class="group-card">
+    <div class="group-card-inner">
+      <svg viewBox="0 0 24 24" fill="currentColor" width="28" height="28" style="color:var(--accent);margin-bottom:10px">
+        <path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/>
+      </svg>
+      <strong class="group-name">{{ g.name }}</strong>
+      <span class="group-count">{{ task_counts.get(g.id, 0) }} 个店铺</span>
+    </div>
+    <div style="position:absolute;top:8px;right:8px;display:flex;gap:2px">
+      <button type="button" class="ibt" title="重命名" style="font-size:14px"
+        onclick="event.stopPropagation();event.preventDefault();openRename({{ g.id }},'{{ g.name|e }}')">✎</button>
+      <form action="/tasks/group/{{ g.id }}/delete" method="post"
+            onclick="event.stopPropagation();event.preventDefault();if(confirm('删除分组「{{ g.name|e }}」及其所有任务？'))this.submit()">
+        <button type="button" class="ibt del" title="删除分组" style="font-size:14px">✕</button>
+      </form>
+    </div>
+  </a>
+  {% endfor %}
+</div>
+{% else %}
+<div class="card" style="text-align:center;padding:60px 20px">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="48" height="48" style="color:var(--text-muted);margin-bottom:16px">
+    <path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z" stroke-linecap="round"/>
+  </svg>
+  <p style="color:var(--text-sub);margin-bottom:16px">暂无分组，请先创建一个分组来组织你的监控任务。</p>
+  <button class="btn btn-primary" onclick="openM('createM')">创建分组</button>
+</div>
+{% endif %}
+
+<!-- 创建分组 Modal -->
+<div id="createM" class="overlay">
+  <div class="modal" style="max-width:420px">
+    <div class="modal-hd">
+      <h3>创建分组</h3>
+      <button class="modal-x" onclick="closeM('createM')">×</button>
+    </div>
+    <div class="modal-bd">
+      <form id="createF" action="/tasks/group-create" method="post">
+        <div class="form-blk">
+          <label>分组名称</label>
+          <input type="text" name="name" class="inp" placeholder="例：电子产品、家居用品" required autofocus>
+        </div>
+      </form>
+    </div>
+    <div class="modal-ft">
+      <button class="btn btn-ghost" onclick="closeM('createM')">取消</button>
+      <button class="btn btn-primary" onclick="document.getElementById('createF').submit()">创建</button>
+    </div>
+  </div>
+</div>
+
+<!-- 导入任务 Modal -->
+<div id="importM" class="overlay">
+  <div class="modal">
+    <div class="modal-hd">
+      <h3>从数据库文件导入任务</h3>
+      <button class="modal-x" onclick="closeM('importM')">×</button>
+    </div>
+    <div class="modal-bd">
+      <div style="margin-bottom:14px;font-size:13px;color:var(--text-sub);line-height:1.7">
+        <p style="margin:0 0 6px">上传 <code style="background:#f0f6ff;padding:1px 5px;border-radius:4px;font-size:12px">.db</code> 数据库文件进行导入：</p>
+        <ul style="margin:0;padding-left:18px">
+          <li><b>新版数据库</b>（含分组信息）：自动还原全部分组和店铺，无需选择分组。</li>
+          <li><b>旧版数据库</b>（无分组信息）：需要选择一个目标分组来存放导入的店铺。</li>
+        </ul>
+      </div>
+      <form id="importF" action="/tasks/group-import" method="post" enctype="multipart/form-data">
+        <div class="form-blk">
+          <label>目标分组 <span style="font-weight:400;color:var(--text-muted)">（仅旧版数据库需要选择）</span></label>
+          <select name="group_id" class="inp">
+            <option value="">自动识别（新版数据库无需选择）</option>
+            {% for g in groups %}
+            <option value="{{ g.id }}">{{ g.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="form-blk">
+          <label>选择数据库文件（.db）</label>
+          <div class="file-drop" id="fileDrop" onclick="document.getElementById('importFile').click()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="32" height="32" style="color:var(--accent);margin-bottom:8px">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" stroke-linecap="round"/>
+              <polyline points="7 10 12 15 17 10" stroke-linecap="round" stroke-linejoin="round"/>
+              <line x1="12" y1="15" x2="12" y2="3" stroke-linecap="round"/>
+            </svg>
+            <span id="fileLabel" style="font-size:13px;color:var(--text-muted);font-weight:700">点击选择或拖拽 .db 文件到此处</span>
+            <input type="file" id="importFile" name="db_file" accept=".db" style="display:none"
+              onchange="document.getElementById('fileLabel').textContent = this.files[0]?.name || '点击选择或拖拽'">
+          </div>
+        </div>
+      </form>
+    </div>
+    <div class="modal-ft">
+      <button class="btn btn-ghost" onclick="closeM('importM')">取消</button>
+      <button class="btn btn-primary" onclick="submitImport()">开始导入</button>
+    </div>
+  </div>
+</div>
+
+<!-- 重命名分组 Modal -->
+<div id="renameM" class="overlay">
+  <div class="modal" style="max-width:420px">
+    <div class="modal-hd">
+      <h3>重命名分组</h3>
+      <button class="modal-x" onclick="closeM('renameM')">×</button>
+    </div>
+    <div class="modal-bd">
+      <form id="renameF" method="post">
+        <div class="form-blk">
+          <label>分组名称</label>
+          <input type="text" id="r-name" name="name" class="inp" required autofocus>
+        </div>
+      </form>
+    </div>
+    <div class="modal-ft">
+      <button class="btn btn-ghost" onclick="closeM('renameM')">取消</button>
+      <button class="btn btn-primary" onclick="document.getElementById('renameF').submit()">保存</button>
+    </div>
+  </div>
+</div>
+
+<style>
+.q-scroll{display:flex;gap:6px;overflow-x:auto;overflow-y:hidden;cursor:grab;-webkit-overflow-scrolling:touch;scrollbar-width:thin;scrollbar-color:var(--border) transparent;padding-bottom:4px}
+.q-scroll:active{cursor:grabbing}
+.q-scroll::-webkit-scrollbar{height:5px}.q-scroll::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}.q-scroll::-webkit-scrollbar-track{background:transparent}
+.q-item{display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border-radius:20px;font-size:12px;font-weight:600;white-space:nowrap;flex-shrink:0}
+.q-run{background:#dcfce7;color:#166534}.q-run i{width:7px;height:7px;border-radius:50%;background:#16a34a;display:inline-block;animation:q-pulse 1.2s infinite}
+.q-wait{background:#f0f6ff;color:#1d4ed8}.q-wait i{width:7px;height:7px;border-radius:50%;background:#93c5fd;display:inline-block}
+@keyframes q-pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.group-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px;padding:4px}
+.group-card{position:relative;display:block;background:var(--bg-card);border:1.5px solid var(--border);border-radius:14px;padding:28px 20px;text-decoration:none;color:inherit;transition:border-color .2s,box-shadow .2s}
+.group-card:hover{border-color:var(--accent);box-shadow:0 4px 16px rgba(59,130,246,.10)}
+.group-card-inner{display:flex;flex-direction:column;align-items:flex-start}
+.group-name{font-size:15px;margin-bottom:4px}
+.group-count{font-size:13px;color:var(--text-sub)}
+</style>
+
+<script>
+function openM(id)  { document.getElementById(id).classList.add('show'); }
+function closeM(id) { document.getElementById(id).classList.remove('show'); }
+function openRename(id, name) {
+  document.getElementById('renameF').action = '/tasks/group/' + id + '/rename';
+  document.getElementById('r-name').value = name;
+  openM('renameM');
+}
+document.querySelectorAll('.overlay').forEach(el =>
+  el.addEventListener('click', e => { if (e.target === el) el.classList.remove('show'); })
+);
+function submitImport() {
+  const input = document.getElementById('importFile');
+  if (!input.files || !input.files[0]) { alert('请先选择一个 .db 文件。'); return; }
+  document.getElementById('importF').submit();
+}
+/* --- Queue panel polling --- */
+var _qData = [];
+function _renderQueue() {
+  var panel = document.getElementById('queuePanel');
+  var list = document.getElementById('qList');
+  var totalEl = document.getElementById('qTotal');
+  if (!_qData.length) { panel.style.display = 'none'; return; }
+  panel.style.display = '';
+  totalEl.textContent = '(' + _qData.length + ')';
+  list.innerHTML = _qData.map(function(it) {
+    var cls = it.status === 'running' ? 'q-run' : 'q-wait';
+    var label = it.status === 'running' ? '运行中' : '等待中';
+    return '<span class="q-item ' + cls + '"><i></i>' + label + '：' + it.name + '</span>';
+  }).join('');
+}
+/* Drag-to-scroll for queue list */
+(function() {
+  var el = document.getElementById('qList');
+  var isDown = false, startX, scrollL;
+  el.addEventListener('mousedown', function(e) { isDown = true; startX = e.pageX - el.offsetLeft; scrollL = el.scrollLeft; });
+  el.addEventListener('mouseleave', function() { isDown = false; });
+  el.addEventListener('mouseup', function() { isDown = false; });
+  el.addEventListener('mousemove', function(e) { if (!isDown) return; e.preventDefault(); el.scrollLeft = scrollL - (e.pageX - el.offsetLeft - startX); });
+})();
+function _pollQueue() {
+  fetch('/api/queue-status').then(function(r) { return r.json(); }).then(function(d) {
+    _qData = d.items || [];
+    _renderQueue();
+  }).catch(function() {});
+}
+_pollQueue();
+setInterval(_pollQueue, 5000);
+
+(function() {
+  const drop = document.getElementById('fileDrop');
+  if (!drop) return;
+  drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('drag-over'); });
+  drop.addEventListener('dragleave', () => drop.classList.remove('drag-over'));
+  drop.addEventListener('drop', e => {
+    e.preventDefault(); drop.classList.remove('drag-over');
+    const file = e.dataTransfer.files[0];
+    if (file) {
+      document.getElementById('importFile').files = e.dataTransfer.files;
+      document.getElementById('fileLabel').textContent = file.name;
+    }
+  });
+})();
+</script>
+{% endblock %}

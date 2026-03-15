@@ -1,0 +1,127 @@
+{% extends "layout.html" %}
+{% block page_title %}总览{% endblock %}
+
+{% block content %}
+
+<div class="stats">
+  <div class="stat">
+    <div class="stat-ico" style="background:var(--accent-soft);color:var(--accent)">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-5 14H7v-2h7v2zm3-4H7v-2h10v2zm0-4H7V7h10v2z"/></svg>
+    </div>
+    <div>
+      <div class="stat-lbl">总任务数</div>
+      <div class="stat-val">{{ tasks_count }}</div>
+    </div>
+  </div>
+  <div class="stat">
+    <div class="stat-ico" style="background:var(--ok-soft);color:var(--ok)">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+    </div>
+    <div>
+      <div class="stat-lbl">运行中</div>
+      <div class="stat-val">{{ active_tasks_count }}</div>
+    </div>
+  </div>
+  <div class="stat">
+    <div class="stat-ico" style="background:var(--warn-soft);color:var(--warn)">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 18c-1.1 0-1.99.9-1.99 2S5.9 22 7 22s2-.9 2-2-.9-2-2-2zM1 2v2h2l3.6 7.59-1.35 2.45c-.16.28-.25.61-.25.96C5 16.1 6.9 18 9 18h12v-2H9.42c-.14 0-.25-.11-.25-.25l.03-.12.9-1.63H19c.75 0 1.41-.41 1.75-1.03l3.58-6.49A1 1 0 0023.44 5H5.21l-.94-2H1zm16 16c-1.1 0-1.99.9-1.99 2s.89 2 1.99 2 2-.9 2-2-.9-2-2-2z"/></svg>
+    </div>
+    <div>
+      <div class="stat-lbl">已发现商品</div>
+      <div class="stat-val">{{ products_count }}</div>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-head">
+    <span class="card-title">任务健康状态</span>
+  </div>
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>任务名称</th>
+          <th>健康状态</th>
+          <th>连续空抓次数</th>
+          <th>可能原因</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for task in unhealthy_tasks %}
+        <tr>
+          <td class="td-bold">{{ task.name }}</td>
+          <td>
+            {% if task.health_state == "alert" %}
+            <span class="badge b-alert"><i></i>告警中</span>
+            {% else %}
+            <span class="badge b-warn"><i></i>需关注</span>
+            {% endif %}
+          </td>
+          <td class="txt-m">{{ task.consecutive_empty_count }} / {{ empty_alert_threshold }}</td>
+          <td style="font-size:12px;color:var(--text-sub);max-width:200px">
+            {% if task.consecutive_empty_count >= empty_alert_threshold %}
+            IP 被封 / 页面改版 / URL 失效
+            {% else %}
+            网络波动 / 临时反爬
+            {% endif %}
+          </td>
+          <td style="white-space:nowrap">
+            <form action="/tasks/{{ task.id }}/run" method="post" style="display:inline">
+              <button type="submit" class="btn btn-primary" style="font-size:12px;padding:4px 10px">立即重试</button>
+            </form>
+            {% if task.category_id %}
+            <a href="/tasks/group/{{ task.category_id }}?highlight={{ task.id }}" class="btn btn-ghost" style="font-size:12px;padding:4px 10px">查看任务</a>
+            {% endif %}
+            <form action="/tasks/{{ task.id }}/reset-health" method="post" style="display:inline"
+                  onsubmit="return confirm('确认重置健康状态？计数将归零。')">
+              <button type="submit" class="btn btn-ghost" style="font-size:12px;padding:4px 10px;color:#6b7280">重置</button>
+            </form>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="td-empty">所有任务运行正常</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-head">
+    <span class="card-title">最近发现的新品</span>
+  </div>
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>商品名称</th>
+          <th>所属任务</th>
+          <th>发现时间</th>
+          <th>链接</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in recent_products %}
+        <tr>
+          <td class="td-bold" style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ item.name }}</td>
+          <td><span class="tag">{{ item.task.name }}</span></td>
+          <td class="txt-m txt-s">
+            {% if item.discovered_at %}
+              {{ item.discovered_at.strftime('%m-%d %H:%M') }}
+            {% else %}
+              -
+            {% endif %}
+          </td>
+          <td><a href="{{ item.product_link }}" target="_blank" class="lnk">查看 ↗</a></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="4" class="td-empty">暂无商品记录</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}

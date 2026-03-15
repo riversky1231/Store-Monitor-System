@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+
+# App data
+*.db
+*.sqlite3
+
+# Encryption key (NEVER commit this file)
+.store_monitor_secret.key
+
+# Monitor script data
+previous_products.json
+
+# PyInstaller
+*.spec
+dist/
+
+# Logs
+logs/*.log
+!logs/.gitkeep
+
+# PM2
+.pm2/
+
+# Startup script with credentials
+start.bat
+
+# Playwright browsers (large binaries)
+playwright-browsers/

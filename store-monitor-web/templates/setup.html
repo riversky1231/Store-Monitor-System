@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>初始化 — 上新监控</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700;9..144,800&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+<div class="setup-page">
+  <div class="setup-box is-visible">
+
+    <div class="setup-brand">
+      <div class="setup-brand-ico">
+        <svg viewBox="0 0 24 24" fill="#ffffff" width="22" height="22"><path d="M3.5 18.49l6-6.01 4 4L22 6.92l-1.41-1.41-7.09 7.97-4-4L2 16.99z"/></svg>
+      </div>
+      <div>
+        <strong>上新监控</strong>
+        <span>Amazon Store Monitor</span>
+      </div>
+    </div>
+
+    <div class="setup-hed">初始化设置</div>
+    <div class="setup-sub">首次使用，请完成以下配置。设置完成后可随时在「邮箱设置」页面修改。</div>
+
+    {% if error %}
+    <div class="alert alert-err">{{ error }}</div>
+    {% endif %}
+
+    <form action="/setup" method="post">
+
+      <div class="section-sep">管理员密码</div>
+      <div class="form-blk">
+        <label>登录密码</label>
+        <input type="password" name="admin_password" class="inp" placeholder="至少 6 位" required minlength="6" autocomplete="new-password">
+        <div class="hint">用于登录本系统后台</div>
+      </div>
+
+      <div class="section-sep">发件邮箱（用于发送新品通知）</div>
+      <div class="form-row-2">
+        <div class="form-blk">
+          <label>SMTP 服务器</label>
+          <input type="text" name="smtp_server" class="inp" value="smtp.qq.com" required>
+        </div>
+        <div class="form-blk">
+          <label>端口</label>
+          <input type="number" name="smtp_port" class="inp" value="465" required>
+        </div>
+      </div>
+      <div class="form-blk">
+        <label>发件邮箱</label>
+        <input type="email" name="sender_email" class="inp" placeholder="your@qq.com" required autocomplete="email">
+      </div>
+      <div class="form-blk">
+        <label>邮箱授权码</label>
+        <input type="password" name="sender_password" class="inp" placeholder="在邮箱 SMTP 设置中获取" required autocomplete="new-password">
+        <div class="hint hint-warn">填写「应用专用授权码」，不是邮箱登录密码</div>
+      </div>
+
+      <button type="submit" class="btn btn-primary btn-lg w-full mt-4">完成设置，开始使用</button>
+
+    </form>
+  </div>
+</div>
+
+</body>
+</html>

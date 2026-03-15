@@ -1,0 +1,530 @@
+{% extends "layout.html" %}
+{% block page_title %}{{ group.name }}{% endblock %}
+
+{% block topbar_extra %}
+<div style="display:flex;gap:8px;align-items:center">
+  <a href="/tasks" class="btn btn-ghost">
+    <svg viewBox="0 0 24 24" fill="currentColor" width="15" height="15"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
+    返回分组
+  </a>
+  {% if pending_imports %}
+  <button class="btn" style="background:#f59e0b;color:#fff" onclick="openM('pendingM')">
+    <svg viewBox="0 0 24 24" fill="currentColor" width="15" height="15"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-2 10H7v-2h10v2z"/></svg>
+    待分配 ({{ pending_imports|length }})
+  </button>
+  {% endif %}
+  <button class="btn btn-primary" onclick="openM('addM')">
+    <svg viewBox="0 0 24 24" fill="currentColor" width="15" height="15"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
+    新增任务
+  </button>
+</div>
+{% endblock %}
+
+{% block content %}
+
+{% if request.query_params.get('run_started') %}
+<div class="alert alert-ok">任务已加入队列，即将运行。</div>
+{% endif %}
+{% if request.query_params.get('already_running') %}
+<div class="alert alert-info">该任务正在执行中，请稍候。</div>
+{% endif %}
+{% if request.query_params.get('import_ok') %}
+<div class="alert alert-ok">
+  导入完成：成功导入 <strong>{{ request.query_params.get('imported') }}</strong> 条，跳过 {{ request.query_params.get('skipped') }} 条。
+</div>
+{% endif %}
+{% if request.query_params.get('batch_moved') %}
+<div class="alert alert-ok">
+  已将 <strong>{{ request.query_params.get('batch_moved') }}</strong> 个店铺移动到「{{ request.query_params.get('target_name') }}」。
+</div>
+{% endif %}
+{% if request.query_params.get('batch_deleted') %}
+<div class="alert alert-ok">已批量删除 <strong>{{ request.query_params.get('batch_deleted') }}</strong> 个店铺。</div>
+{% endif %}
+{% if request.query_params.get('claimed') %}
+<div class="alert alert-ok">已从待分配列表导入 <strong>{{ request.query_params.get('claimed') }}</strong> 个店铺到本分组。</div>
+{% endif %}
+{% if request.query_params.get('error') %}
+<div class="alert alert-err">{{ request.query_params.get('error') }}</div>
+{% endif %}
+
+<div class="card">
+  <div class="toolbar">
+    <form class="search-form" method="get" action="/tasks/group/{{ group.id }}">
+      <div class="search-wrap">
+        <svg class="search-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+          <circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="22" y2="22"/>
+        </svg>
+        <input type="text" name="search" class="inp search-inp" placeholder="搜索任务名称…" value="{{ search }}">
+      </div>
+      <button type="submit" class="btn btn-ghost">搜索</button>
+      {% if search %}
+      <a href="/tasks/group/{{ group.id }}" class="btn btn-ghost">清除</a>
+      {% endif %}
+    </form>
+    <span class="pag-info">共 {{ total }} 条</span>
+  </div>
+
+  <!-- Batch action bar — hidden until checkboxes are ticked -->
+  <div id="batchBar" class="batch-bar" style="display:none">
+    <span id="batchCount">已选 0 项</span>
+    <button class="btn btn-ghost" onclick="openBatchMove()" style="font-size:13px">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      移动到…
+    </button>
+    <button class="btn del" onclick="submitBatchDelete()" style="font-size:13px;background:#fee2e2;color:#dc2626;border:1px solid #fca5a5">
+      <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+      批量删除
+    </button>
+    <button class="btn btn-ghost" onclick="clearSelection()" style="font-size:13px">取消选择</button>
+  </div>
+
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:36px"><input type="checkbox" id="checkAll" onchange="toggleAll(this)"></th>
+          <th>任务名称</th>
+          <th>监控地址</th>
+          <th>频率</th>
+          <th>状态</th>
+          <th>健康</th>
+          <th>下次执行</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for task in tasks %}
+        <tr id="task-{{ task.id }}" class="{% if request.query_params.get('highlight') == task.id|string %}highlight-row{% endif %}">
+          <td><input type="checkbox" class="row-chk" value="{{ task.id }}" onchange="updateBatchBar()"></td>
+          <td class="td-bold">
+            {{ task.name }}
+            {% if task.task_type == 'storefront' %}
+            <span class="type-tag sf">SF</span>
+            {% endif %}
+          </td>
+          <td class="td-url">
+            <a href="{{ task.url }}" target="_blank" title="{{ task.url }}">{{ task.url }}</a>
+          </td>
+          <td class="txt-m txt-s">每 {{ task.check_interval_hours }}h</td>
+          <td>
+            {% if task.is_active %}
+            <span class="badge b-on"><i></i>运行中</span>
+            {% else %}
+            <span class="badge b-off"><i></i>已暂停</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if not task.is_active %}
+            <span class="txt-m">—</span>
+            {% elif task.health_state == "alert" %}
+            <span class="badge b-alert"><i></i>告警 ({{ task.consecutive_empty_count }})</span>
+            {% elif task.health_state == "warning" %}
+            <span class="badge b-warn"><i></i>{{ task.consecutive_empty_count }}/{{ empty_alert_threshold }}</span>
+            {% else %}
+            <span class="badge b-ok"><i></i>正常</span>
+            {% endif %}
+          </td>
+          <td class="txt-m txt-s">
+            {% if task.id in inflight_ids %}
+            <span class="running-now">
+              <svg class="spin-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <path d="M12 2a10 10 0 0 1 10 10" stroke-linecap="round"/>
+              </svg>
+              检索中…
+            </span>
+            {% elif task.is_active and task.next_run_at %}
+            {{ task.next_run_at.strftime('%m-%d %H:%M') }}
+            {% else %}—{% endif %}
+          </td>
+          <td>
+            <div class="acts">
+              <form action="/tasks/{{ task.id }}/run" method="post" style="display:inline">
+                <button type="submit" class="ibt" title="立即运行">▶</button>
+              </form>
+              <button class="ibt" title="编辑"
+                onclick="openEdit({{ task.id }},'{{ task.name|e }}','{{ task.url|e }}','{{ task.selector|e }}',{{ task.check_interval_hours }},'{{ task.recipients|e }}',{{ 'true' if task.is_active else 'false' }},'{{ task.task_type or 'search' }}')">
+                ✎
+              </button>
+              <button class="ibt" title="移动到其他分组"
+                onclick="openSingleMove({{ task.id }},'{{ task.name|e }}')">
+                ⇄
+              </button>
+              <form action="/tasks/{{ task.id }}/toggle" method="post" style="display:inline">
+                <button type="submit" class="ibt" title="{{ '暂停' if task.is_active else '启用' }}">⏸</button>
+              </form>
+              <form action="/tasks/{{ task.id }}/delete" method="post" style="display:inline"
+                    onsubmit="return confirm('删除「{{ task.name|e }}」？')">
+                <button type="submit" class="ibt del" title="删除">✕</button>
+              </form>
+            </div>
+          </td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="8" class="td-empty">
+            {% if search %}没有找到名称包含「{{ search }}」的任务{% else %}暂无任务，点击右上角「新增任务」添加店铺{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if total_pages > 1 %}
+  <div class="pagination">
+    <span class="pag-info">第 {{ page }} / {{ total_pages }} 页</span>
+    <div class="pag-btns">
+      {% if page > 1 %}
+      <a class="pag-btn" href="/tasks/group/{{ group.id }}?page=1{% if search %}&search={{ search|urlencode }}{% endif %}">«</a>
+      <a class="pag-btn" href="/tasks/group/{{ group.id }}?page={{ page - 1 }}{% if search %}&search={{ search|urlencode }}{% endif %}">‹</a>
+      {% else %}
+      <span class="pag-btn" disabled>«</span><span class="pag-btn" disabled>‹</span>
+      {% endif %}
+      {% for p in range([1, page - 2]|max, [total_pages + 1, page + 3]|min) %}
+      <a class="pag-btn {% if p == page %}on{% endif %}"
+         href="/tasks/group/{{ group.id }}?page={{ p }}{% if search %}&search={{ search|urlencode }}{% endif %}">{{ p }}</a>
+      {% endfor %}
+      {% if page < total_pages %}
+      <a class="pag-btn" href="/tasks/group/{{ group.id }}?page={{ page + 1 }}{% if search %}&search={{ search|urlencode }}{% endif %}">›</a>
+      <a class="pag-btn" href="/tasks/group/{{ group.id }}?page={{ total_pages }}{% if search %}&search={{ search|urlencode }}{% endif %}">»</a>
+      {% else %}
+      <span class="pag-btn" disabled>›</span><span class="pag-btn" disabled>»</span>
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+</div>
+
+<!-- 新增任务 Modal -->
+<div id="addM" class="overlay">
+  <div class="modal">
+    <div class="modal-hd">
+      <h3>新增监控任务</h3>
+      <button class="modal-x" onclick="closeM('addM')">×</button>
+    </div>
+    <div class="modal-bd">
+      <form id="addF" action="/tasks/group/{{ group.id }}/add" method="post">
+        <div class="form-blk">
+          <label>任务名称</label>
+          <input type="text" name="name" class="inp" placeholder="例：某某店铺上新监控" required>
+        </div>
+        <div class="form-blk">
+          <label>店铺 URL</label>
+          <input type="url" name="url" class="inp" placeholder="https://www.amazon.com/s?me=卖家ID" required>
+        </div>
+        <div class="form-blk">
+          <label>页面类型</label>
+          <select name="task_type" id="a-type" class="inp" onchange="onTypeChange('a')">
+            <option value="search">Amazon 搜索结果页</option>
+            <option value="storefront">Amazon Storefront（品牌店铺）</option>
+          </select>
+          <div class="hint">Storefront 页面会自动遍历所有分类 Tab，无需填写选择器</div>
+        </div>
+        <div class="form-blk" id="a-sel-blk">
+          <label>CSS 选择器</label>
+          <input type="text" name="selector" id="a-sel" class="inp" value='div[data-component-type="s-search-result"]' required>
+          <div class="hint">Amazon 搜索结果页使用默认值即可</div>
+        </div>
+        <div class="form-row-2">
+          <div class="form-blk">
+            <label>检查频率（小时）</label>
+            <input type="number" name="check_interval_hours" class="inp" value="24" min="1" max="168" required>
+          </div>
+          <div class="form-blk" style="display:flex;align-items:flex-end;padding-bottom:2px">
+            <label class="check-row">
+              <input type="checkbox" name="is_active" value="true" checked>
+              创建后立即启用
+            </label>
+          </div>
+        </div>
+        <div class="form-blk">
+          <label>通知邮箱</label>
+          <input type="text" name="recipients" class="inp" placeholder="a@qq.com, b@163.com" required>
+          <div class="hint">多个邮箱用英文逗号分隔</div>
+        </div>
+      </form>
+    </div>
+    <div class="modal-ft">
+      <button class="btn btn-ghost" onclick="closeM('addM')">取消</button>
+      <button class="btn btn-primary" onclick="document.getElementById('addF').submit()">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 编辑任务 Modal -->
+<div id="editM" class="overlay">
+  <div class="modal">
+    <div class="modal-hd">
+      <h3>编辑监控任务</h3>
+      <button class="modal-x" onclick="closeM('editM')">×</button>
+    </div>
+    <div class="modal-bd">
+      <form id="editF" method="post">
+        <div class="form-blk">
+          <label>任务名称</label>
+          <input type="text" id="e-name" name="name" class="inp" required>
+        </div>
+        <div class="form-blk">
+          <label>店铺 URL</label>
+          <input type="url" id="e-url" name="url" class="inp" required>
+        </div>
+        <div class="form-blk">
+          <label>页面类型</label>
+          <select name="task_type" id="e-type" class="inp" onchange="onTypeChange('e')">
+            <option value="search">Amazon 搜索结果页</option>
+            <option value="storefront">Amazon Storefront（品牌店铺）</option>
+          </select>
+        </div>
+        <div class="form-blk" id="e-sel-blk">
+          <label>CSS 选择器</label>
+          <input type="text" id="e-sel" name="selector" class="inp" required>
+        </div>
+        <div class="form-row-2">
+          <div class="form-blk">
+            <label>检查频率（小时）</label>
+            <input type="number" id="e-hrs" name="check_interval_hours" class="inp" min="1" max="168" required>
+          </div>
+          <div class="form-blk" style="display:flex;align-items:flex-end;padding-bottom:2px">
+            <label class="check-row">
+              <input type="checkbox" id="e-act" name="is_active" value="true">
+              启用此任务
+            </label>
+          </div>
+        </div>
+        <div class="form-blk">
+          <label>通知邮箱</label>
+          <input type="text" id="e-rec" name="recipients" class="inp" required>
+          <div class="hint">多个邮箱用英文逗号分隔</div>
+        </div>
+      </form>
+    </div>
+    <div class="modal-ft">
+      <button class="btn btn-ghost" onclick="closeM('editM')">取消</button>
+      <button class="btn btn-primary" onclick="document.getElementById('editF').submit()">保存修改</button>
+    </div>
+  </div>
+</div>
+
+<!-- 移动到分组 Modal -->
+<div id="moveM" class="overlay">
+  <div class="modal" style="max-width:420px">
+    <div class="modal-hd">
+      <h3 id="moveTitle">移动店铺</h3>
+      <button class="modal-x" onclick="closeM('moveM')">×</button>
+    </div>
+    <div class="modal-bd">
+      <form id="moveF" method="post">
+        <input type="hidden" name="source_group_id" value="{{ group.id }}">
+        <div id="moveTaskInputs"></div>
+        <div class="form-blk">
+          <label>目标分组</label>
+          <select name="target_group_id" class="inp" required>
+            <option value="">请选择目标分组</option>
+            {% for g in all_groups %}
+            {% if g.id != group.id %}
+            <option value="{{ g.id }}">{{ g.name }}</option>
+            {% endif %}
+            {% endfor %}
+          </select>
+        </div>
+      </form>
+    </div>
+    <div class="modal-ft">
+      <button class="btn btn-ghost" onclick="closeM('moveM')">取消</button>
+      <button class="btn btn-primary" onclick="submitMove()">确认移动</button>
+    </div>
+  </div>
+</div>
+
+<!-- 从待分配列表选择 Modal -->
+{% if pending_imports %}
+<div id="pendingM" class="overlay">
+  <div class="modal" style="max-width:640px">
+    <div class="modal-hd">
+      <h3>从待分配列表导入到「{{ group.name }}」</h3>
+      <button class="modal-x" onclick="closeM('pendingM')">×</button>
+    </div>
+    <div class="modal-bd">
+      <div style="margin-bottom:10px;display:flex;align-items:center;justify-content:space-between">
+        <label class="check-row" style="font-size:13px">
+          <input type="checkbox" id="pendingAll" onchange="togglePendingAll(this)"> 全选
+        </label>
+        <span id="pendingSel" style="font-size:12px;color:var(--text-sub)">已选 0 项</span>
+      </div>
+      <form id="pendingF" action="/tasks/group/{{ group.id }}/claim-pending" method="post">
+        <div class="pending-list">
+          {% for p in pending_imports %}
+          <label class="pending-row">
+            <input type="checkbox" name="pending_ids" value="{{ p.id }}" class="p-chk" onchange="updatePendingSel()">
+            <span class="pending-name">{{ p.name }}</span>
+            <span class="pending-url" title="{{ p.url }}">{{ p.url }}</span>
+          </label>
+          {% endfor %}
+        </div>
+      </form>
+    </div>
+    <div class="modal-ft">
+      <button class="btn btn-ghost" onclick="closeM('pendingM')">取消</button>
+      <button class="btn btn-primary" onclick="submitPending()">导入选中项</button>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+<style>
+.pending-list{max-height:400px;overflow-y:auto;border:1px solid var(--border);border-radius:8px}
+.pending-row{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .15s}
+.pending-row:last-child{border-bottom:none}
+.pending-row:hover{background:#f8fafc}
+.pending-name{font-weight:600;font-size:13px;white-space:nowrap;min-width:120px}
+.pending-url{font-size:12px;color:var(--text-sub);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.highlight-row{animation:hl-fade 3s ease}
+@keyframes hl-fade{0%,40%{background:#fef9c3}100%{background:transparent}}
+.batch-bar{display:flex;align-items:center;gap:10px;padding:8px 16px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;margin:0 0 -1px;font-size:13px;font-weight:600;color:#1d4ed8}
+.type-tag{display:inline-block;font-size:10px;font-weight:700;padding:1px 5px;border-radius:4px;vertical-align:middle;margin-left:4px}
+.type-tag.sf{background:#dbeafe;color:#1d4ed8}
+</style>
+
+<script>
+function openM(id)  { document.getElementById(id).classList.add('show'); }
+function closeM(id) { document.getElementById(id).classList.remove('show'); }
+function openEdit(id, name, url, sel, hrs, rec, active, taskType) {
+  document.getElementById('editF').action = '/tasks/' + id + '/edit';
+  document.getElementById('e-name').value = name;
+  document.getElementById('e-url').value  = url;
+  document.getElementById('e-sel').value  = sel;
+  document.getElementById('e-hrs').value  = hrs;
+  document.getElementById('e-rec').value  = rec;
+  document.getElementById('e-act').checked = active;
+  document.getElementById('e-type').value = taskType || 'search';
+  onTypeChange('e');
+  openM('editM');
+}
+function onTypeChange(prefix) {
+  var type = document.getElementById(prefix + '-type').value;
+  var selBlk = document.getElementById(prefix + '-sel-blk');
+  var selInp = document.getElementById(prefix + '-sel');
+  if (type === 'storefront') {
+    selBlk.style.display = 'none';
+    selInp.removeAttribute('required');
+    selInp.value = selInp.value || 'storefront-auto';
+  } else {
+    selBlk.style.display = '';
+    selInp.setAttribute('required', 'required');
+    if (selInp.value === 'storefront-auto') selInp.value = 'div[data-component-type="s-search-result"]';
+  }
+}
+document.querySelectorAll('.overlay').forEach(el =>
+  el.addEventListener('click', e => { if (e.target === el) el.classList.remove('show'); })
+);
+
+/* --- Batch selection --- */
+function getCheckedIds() {
+  return Array.from(document.querySelectorAll('.row-chk:checked')).map(c => c.value);
+}
+function updateBatchBar() {
+  const ids = getCheckedIds();
+  const bar = document.getElementById('batchBar');
+  bar.style.display = ids.length ? 'flex' : 'none';
+  document.getElementById('batchCount').textContent = '已选 ' + ids.length + ' 项';
+  // Sync "check all" state.
+  const all = document.querySelectorAll('.row-chk');
+  document.getElementById('checkAll').checked = all.length > 0 && ids.length === all.length;
+}
+function toggleAll(master) {
+  document.querySelectorAll('.row-chk').forEach(c => c.checked = master.checked);
+  updateBatchBar();
+}
+function clearSelection() {
+  document.querySelectorAll('.row-chk').forEach(c => c.checked = false);
+  document.getElementById('checkAll').checked = false;
+  updateBatchBar();
+}
+
+/* --- Batch move --- */
+function _fillMoveInputs(ids) {
+  const container = document.getElementById('moveTaskInputs');
+  container.innerHTML = '';
+  ids.forEach(id => {
+    const inp = document.createElement('input');
+    inp.type = 'hidden'; inp.name = 'task_ids'; inp.value = id;
+    container.appendChild(inp);
+  });
+}
+function openBatchMove() {
+  const ids = getCheckedIds();
+  if (!ids.length) return;
+  document.getElementById('moveF').action = '/tasks/batch-move';
+  document.getElementById('moveTitle').textContent = '批量移动 ' + ids.length + ' 个店铺';
+  _fillMoveInputs(ids);
+  openM('moveM');
+}
+function openSingleMove(taskId, taskName) {
+  document.getElementById('moveF').action = '/tasks/batch-move';
+  document.getElementById('moveTitle').textContent = '移动「' + taskName + '」';
+  _fillMoveInputs([taskId]);
+  openM('moveM');
+}
+function submitMove() {
+  const sel = document.querySelector('#moveF select[name="target_group_id"]');
+  if (!sel.value) { alert('请选择目标分组。'); return; }
+  document.getElementById('moveF').submit();
+}
+
+/* --- Batch delete --- */
+function submitBatchDelete() {
+  const ids = getCheckedIds();
+  if (!ids.length) return;
+  if (!confirm('确认删除选中的 ' + ids.length + ' 个店铺？此操作不可恢复。')) return;
+  const form = document.createElement('form');
+  form.method = 'POST'; form.action = '/tasks/batch-delete';
+  ids.forEach(id => {
+    const inp = document.createElement('input');
+    inp.type = 'hidden'; inp.name = 'task_ids'; inp.value = id;
+    form.appendChild(inp);
+  });
+  const src = document.createElement('input');
+  src.type = 'hidden'; src.name = 'source_group_id'; src.value = '{{ group.id }}';
+  form.appendChild(src);
+  document.body.appendChild(form);
+  form.submit();
+}
+
+/* --- Pending imports selection --- */
+function togglePendingAll(master) {
+  document.querySelectorAll('.p-chk').forEach(c => c.checked = master.checked);
+  updatePendingSel();
+}
+function updatePendingSel() {
+  var n = document.querySelectorAll('.p-chk:checked').length;
+  var el = document.getElementById('pendingSel');
+  if (el) el.textContent = '已选 ' + n + ' 项';
+  var all = document.querySelectorAll('.p-chk');
+  var allEl = document.getElementById('pendingAll');
+  if (allEl) allEl.checked = all.length > 0 && n === all.length;
+}
+function submitPending() {
+  var n = document.querySelectorAll('.p-chk:checked').length;
+  if (!n) { alert('请至少选择一个店铺。'); return; }
+  document.getElementById('pendingF').submit();
+}
+
+/* --- Auto refresh (pause when batch selected or modal open) --- */
+setInterval(() => {
+  const hasOpenModal = Array.from(document.querySelectorAll('.overlay'))
+    .some(el => el.classList.contains('show'));
+  const focusedTag = (document.activeElement?.tagName || '').toUpperCase();
+  const typing = focusedTag === 'INPUT' || focusedTag === 'TEXTAREA' || focusedTag === 'SELECT';
+  const hasBatch = getCheckedIds().length > 0;
+  if (!document.hidden && !hasOpenModal && !typing && !hasBatch) {
+    window.location.reload();
+  }
+}, 15000);
+
+(function() {
+  const row = document.querySelector('.highlight-row');
+  if (row) row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+})();
+</script>
+{% endblock %}
