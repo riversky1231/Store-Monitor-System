@@ -3,6 +3,13 @@
 
 {% block topbar_extra %}
 <div style="display:flex;gap:8px;align-items:center">
+  <button class="btn btn-ghost" onclick="checkNetwork()" id="netCheckBtn">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" width="15" height="15">
+      <path d="M1 9l2-2m0 0l4-4 4 4M3 7v10a2 2 0 002 2h14" stroke-linecap="round"/>
+      <circle cx="19" cy="12" r="3"/>
+    </svg>
+    网络检测
+  </button>
   <button class="btn btn-ghost" onclick="openM('importM')">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" width="15" height="15">
       <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" stroke-linecap="round"/>
@@ -22,8 +29,8 @@
       全部执行
     </button>
   </form>
-  <form action="/tasks/queue/stop" method="post" style="display:inline"
-        onsubmit="return confirm('确认强制停止当前运行中的任务和等待队列？\n这会中断当前抓取并清空队列。')">
+  <form action="/tasks/queue/stop" method="post" style="display:inline" id="stopForm"
+        onsubmit="return confirmAndStop()">
     <button type="submit" class="btn" style="background:#dc2626;color:#fff">
       <svg viewBox="0 0 24 24" fill="currentColor" width="15" height="15"><path d="M6 6h12v12H6z"/></svg>
       强制停止
@@ -255,6 +262,7 @@
 .q-run{background:#dcfce7;color:#166534}.q-run i{width:7px;height:7px;border-radius:50%;background:#16a34a;display:inline-block;animation:q-pulse 1.2s infinite}
 .q-wait{background:#f0f6ff;color:#1d4ed8}.q-wait i{width:7px;height:7px;border-radius:50%;background:#93c5fd;display:inline-block}
 @keyframes q-pulse{0%,100%{opacity:1}50%{opacity:.3}}
+@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
 .group-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px;padding:4px}
 .group-card{position:relative;display:block;background:var(--bg-card);border:1.5px solid var(--border);border-radius:14px;padding:28px 20px;text-decoration:none;color:inherit;transition:border-color .2s,box-shadow .2s}
 .group-card:hover{border-color:var(--accent);box-shadow:0 4px 16px rgba(59,130,246,.10)}
@@ -311,6 +319,42 @@ function _pollQueue() {
 }
 _pollQueue();
 setInterval(_pollQueue, 5000);
+
+function confirmAndStop() {
+  if (!confirm('确认强制停止当前运行中的任务和等待队列？\n这会中断当前抓取并清空队列。')) {
+    return false;
+  }
+  // Submit the form and then refresh after a short delay
+  setTimeout(function() {
+    _pollQueue();  // Immediately update queue status
+    setTimeout(function() { location.reload(); }, 2000);  // Refresh page after 2s
+  }, 500);
+  return true;
+}
+
+/* Network check */
+function checkNetwork() {
+  var btn = document.getElementById('netCheckBtn');
+  var originalText = btn.innerHTML;
+  btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="15" height="15" style="animation:spin 1s linear infinite"><circle cx="12" cy="12" r="10"/></svg> 检测中...';
+  btn.disabled = true;
+  
+  fetch('/api/network-check')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var details = data.details.map(function(d) {
+        return d.name + ': ' + d.status + (d.time_ms ? ' (' + d.time_ms + 'ms)' : '') + (d.note ? ' - ' + d.note : '');
+      }).join('\n');
+      alert(data.message + '\n\n详细信息:\n' + details);
+    })
+    .catch(function(e) {
+      alert('❌ 网络检测失败: ' + e.message);
+    })
+    .finally(function() {
+      btn.innerHTML = originalText;
+      btn.disabled = false;
+    });
+}
 
 (function() {
   const drop = document.getElementById('fileDrop');

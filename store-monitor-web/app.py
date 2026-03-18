@@ -82,11 +82,13 @@ def _apply_proxy_from_db() -> None:
         else:
             os.environ.pop("HTTP_PROXY", None)
             os.environ.pop("HTTPS_PROXY", None)
+    except Exception as exc:
+        logger.warning("Failed to load proxy from database: %s", exc)
     finally:
         try:
             db.close()
-        except Exception:
-            pass
+        except Exception as close_exc:
+            logger.debug("Error closing database session: %s", close_exc)
 
 
 _apply_proxy_from_db()
@@ -265,6 +267,21 @@ templates_dir = get_resource_path("templates")
 # but for serving static, we use the bundled one.
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 templates = Jinja2Templates(directory=templates_dir)
+
+# Add custom filter to convert UTC to Beijing time (UTC+8)
+import datetime
+def to_beijing_time(dt):
+    """Convert UTC datetime to Beijing time (UTC+8)."""
+    if dt is None:
+        return ""
+    if dt.tzinfo is None:
+        # Assume naive datetime is UTC
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
+    beijing_dt = dt.astimezone(beijing_tz)
+    return beijing_dt.strftime('%m-%d %H:%M')
+
+templates.env.filters["beijing"] = to_beijing_time
 
 from routes.web import router as web_router, public_router
 app.include_router(public_router)

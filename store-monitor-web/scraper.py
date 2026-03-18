@@ -49,8 +49,10 @@ _NOISE_TITLE_PATTERNS = (
     "gift cards",
     "balance reload",
     "reload your balance",
+    "reload your gift",
     "auto-reload",
     "sponsored",
+    "amazon product b",  # Generic placeholder names like "Amazon Product B09XXX"
 )
 
 
@@ -223,20 +225,62 @@ def _extract_link(el) -> str:
     return ""
 
 
-def _scroll_to_load(page: Page, rounds: int = 8) -> None:
+def _scroll_to_load(page: Page, max_scroll_time: int = 60, click_show_more: bool = True) -> None:
+    """Scroll the page until no more content loads.
+    
+    Args:
+        page: Playwright page object.
+        max_scroll_time: Maximum time in seconds to spend scrolling (safety limit).
+        click_show_more: Whether to click "Show More" / "See More" buttons.
+    """
+    start_time = time.time()
     last_height = 0
-    stable_rounds = 0
-    for _ in range(rounds):
+    stable_count = 0
+    
+    # First, try to click any "Show More" / "See More" buttons
+    if click_show_more:
+        show_more_selectors = [
+            "button:has-text('See more')",
+            "button:has-text('Show more')",
+            "a:has-text('See more')",
+            "a:has-text('Show more')",
+            "[data-action='show-more']",
+            "button:has-text('Load more')",
+        ]
+        for selector in show_more_selectors:
+            try:
+                btn = page.locator(selector).first
+                if btn.count() > 0 and btn.is_visible():
+                    btn.click(timeout=2000)
+                    logger.warning("[DEBUG] Clicked 'Show More' button: %s", selector)
+                    time.sleep(1.5)
+                    _update_activity()
+            except Exception:
+                pass
+    
+    # Scroll until page height stops changing (all content loaded)
+    scroll_count = 0
+    while True:
+        # Safety: check time limit
+        if time.time() - start_time > max_scroll_time:
+            logger.warning("[DEBUG] Scroll timeout after %ds, stopping.", max_scroll_time)
+            break
+        
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        time.sleep(1.2)
+        time.sleep(2.0)  # Wait longer for lazy loading
+        _update_activity()
+        scroll_count += 1
+        
         height = page.evaluate("document.body.scrollHeight")
         if height == last_height:
-            stable_rounds += 1
-            if stable_rounds >= 2:
+            stable_count += 1
+            if stable_count >= 3:  # Height stable for 3 rounds = done loading
+                logger.warning("[DEBUG] Scroll complete after %d scrolls, height=%d", scroll_count, height)
                 break
         else:
-            stable_rounds = 0
+            stable_count = 0
         last_height = height
+    
     page.evaluate("window.scrollTo(0, 0)")
     time.sleep(0.3)
 
@@ -311,6 +355,8 @@ def _collect_products_from_page(
                 continue
 
             products.append({"name": title, "link": link, "asin": asin})
+            _add_partial_result({"name": title, "link": link, "asin": asin})  # Save to partial results.
+            _update_activity()  # Mark progress when product captured.
         except Exception as exc:
             logger.debug("Element parse failed: %s", exc)
 
@@ -337,6 +383,8 @@ def _collect_products_from_page(
                 if _is_noise_title(title):
                     continue
                 products.append({"name": title, "link": link, "asin": asin})
+                _add_partial_result({"name": title, "link": link, "asin": asin})  # Save to partial results.
+                _update_activity()  # Mark progress when product captured.
             except Exception as exc:
                 logger.debug("Fallback anchor parse failed: %s", exc)
                 continue
@@ -350,6 +398,7 @@ def _navigate_with_retry(page: Page, url: str, max_attempts: int = 3) -> bool:
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=90000)
             time.sleep(random.uniform(1.0, 2.2))
+            _update_activity()  # Mark progress on successful navigation.
             return True
         except Exception as exc:
             logger.warning("Navigate failed attempt %d/%d: %s", attempt, max_attempts, exc)
@@ -381,10 +430,11 @@ def _scrape_all_pages(
 
         try:
             page.wait_for_selector(selector, timeout=15000)
-        except Exception:
+        except Exception as exc:
+            logger.debug("Selector wait timeout on page %d: %s", page_num, exc)
             logger.info("Selector wait timeout on page %d, continuing with fallback.", page_num)
 
-        _scroll_to_load(page)
+        _scroll_to_load(page, click_show_more=False)  # Don't click buttons that may navigate away
         page_products = _collect_products_from_page(page, selector, base_url, seen_asins, seen_links)
         products.extend(page_products)
         logger.info(
@@ -400,7 +450,8 @@ def _scrape_all_pages(
                         page.title(),
                         page.url,
                     )
-                except Exception:
+                except Exception as exc:
+                    logger.debug("Failed to get page title/url: %s", exc)
                     logger.warning("Empty results on page 1.")
                 _dump_page_snapshot(page, "empty_page")
             logger.info("No products on page %d, stopping pagination.", page_num)
@@ -417,102 +468,209 @@ def _product_matches(db_product: ProductItem, item: Dict[str, str]) -> bool:
     return item.get("link", "") == db_product.product_link
 
 
+class ScrapeIncomplete(Exception):
+    """Raised when scrape returned too few products (network issue suspected)."""
+    pass
+
+
 def _sync_products_to_db(
     db: Session,
     task_id: int,
     current_products: List[Dict[str, str]],
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]]]:
+    """
+    Atomic sync of scraped products to database.
+    
+    Implements:
+    1. Atomic operation: all changes commit together or rollback on failure
+    2. Integrity check: skip update if scrape is incomplete (< 70% of peak)
+    3. Removal confirmation: products must be missing 3 consecutive times to be marked removed
+    4. Peak tracking: remember historical max product count for integrity validation
+    
+    Returns: (current_products, new_products, removed_products)
+    Raises: ScrapeIncomplete if scrape returned too few products (should retry later)
+    """
+    MISS_THRESHOLD = 3  # Consecutive misses required to confirm removal
+    INTEGRITY_RATIO = 0.7  # Min ratio of current/peak to accept update
+    MIN_PRODUCTS_THRESHOLD = 5  # Below this count, always consider incomplete
+    
     now = datetime.datetime.now(datetime.timezone.utc)
-    all_db_products = db.query(ProductItem).filter(ProductItem.task_id == task_id).all()
-
-    # Baseline mode: first successful crawl seeds data but does not alert.
-    if not all_db_products and current_products:
+    
+    try:
+        # Load task and all existing products
+        from models import MonitorTask
+        task = db.query(MonitorTask).filter(MonitorTask.id == task_id).first()
+        if not task:
+            logger.error("Task %s not found in database.", task_id)
+            return [], [], []
+        
+        all_db_products = db.query(ProductItem).filter(ProductItem.task_id == task_id).all()
+        
+        # BASELINE MODE: First successful crawl seeds data but does not alert
+        if not all_db_products and current_products:
+            # But reject if too few products on first run (likely network issue)
+            if len(current_products) < MIN_PRODUCTS_THRESHOLD:
+                logger.warning(
+                    "[ATOMIC] Task %s: First run got only %d products - likely network issue. "
+                    "Rejecting to avoid bad baseline.",
+                    task_id, len(current_products)
+                )
+                raise ScrapeIncomplete(f"First run got only {len(current_products)} products")
+            
+            for item in current_products:
+                if _is_noise_title(item.get("name")):
+                    continue
+                db.add(ProductItem(
+                    task_id=task_id,
+                    product_link=item["link"],
+                    asin=item.get("asin") or None,
+                    name=item["name"],
+                    miss_count=0,
+                ))
+            # Set initial peak
+            task.peak_product_count = len(current_products)
+            db.commit()
+            logger.info(
+                "Task %s baseline initialized with %d products; skip email on first run.",
+                task_id, len(current_products),
+            )
+            return current_products, [], []
+        
+        # EMPTY SCRAPE: Completely failed - raise exception for retry
+        if not current_products:
+            logger.warning("[ATOMIC] Task %s finished with 0 products - network failure suspected.", task_id)
+            raise ScrapeIncomplete("Scrape returned 0 products")
+        
+        # INTEGRITY CHECK: Reject incomplete scrapes
+        peak = task.peak_product_count or 0
+        active_in_db = sum(1 for p in all_db_products if p.removed_at is None)
+        reference_count = max(peak, active_in_db)
+        
+        if reference_count > 0:
+            scrape_ratio = len(current_products) / reference_count
+            if scrape_ratio < INTEGRITY_RATIO:
+                logger.warning(
+                    "[ATOMIC] Task %s: Scrape incomplete - got %d products, expected ~%d (ratio=%.2f < %.2f). "
+                    "REJECTING this scrape - will retry later.",
+                    task_id, len(current_products), reference_count, scrape_ratio, INTEGRITY_RATIO
+                )
+                # Raise exception so scheduler knows to retry
+                raise ScrapeIncomplete(
+                    f"Got {len(current_products)} products, expected ~{reference_count} (ratio={scrape_ratio:.2f})"
+                )
+        
+        # Update peak if we got more products than ever before
+        if len(current_products) > peak:
+            task.peak_product_count = len(current_products)
+            logger.info("Task %s: New peak product count: %d (was %d)", task_id, len(current_products), peak)
+        
+        # Clean noise products from DB
+        noise_ids = {p.id for p in all_db_products if _is_noise_title(p.name)}
+        if noise_ids:
+            for p in all_db_products:
+                if p.id in noise_ids:
+                    db.delete(p)
+            all_db_products = [p for p in all_db_products if p.id not in noise_ids]
+            logger.info("Task %s: removed %d noise products from DB.", task_id, len(noise_ids))
+        
+        # Build lookup sets
+        db_asins = {p.asin for p in all_db_products if p.asin}
+        db_links = {p.product_link for p in all_db_products}
+        current_asins = {item["asin"] for item in current_products if item.get("asin")}
+        current_links = {item["link"] for item in current_products}
+        
+        # Filter noise from current scrape
+        current_products = [item for item in current_products if not _is_noise_title(item.get("name"))]
+        
+        # === DETECT NEW PRODUCTS ===
+        new_products: List[Dict[str, str]] = []
         for item in current_products:
-            db.add(ProductItem(
-                task_id=task_id,
-                product_link=item["link"],
-                asin=item.get("asin") or None,
-                name=item["name"],
-            ))
-        db.commit()
-        logger.info(
-            "Task %s baseline initialized with %d products; skip email on first run.",
-            task_id,
-            len(current_products),
-        )
-        return current_products, [], []
-
-    # If scrape returned nothing and existing data is present, treat as a failure —
-    # don't mark every product as removed. The scheduler handles repeated empties separately.
-    if not current_products:
-        logger.warning("Task %s finished with 0 products.", task_id)
-        return [], [], []
-
-    noise_ids = {p.id for p in all_db_products if _is_noise_title(p.name)}
-    if noise_ids:
+            asin = item.get("asin", "")
+            is_known = (asin and asin in db_asins) or item["link"] in db_links
+            if not is_known:
+                new_products.append(item)
+                db.add(ProductItem(
+                    task_id=task_id,
+                    product_link=item["link"],
+                    asin=asin or None,
+                    name=item["name"],
+                    miss_count=0,
+                ))
+        
+        # === DETECT REMOVED PRODUCTS (with confirmation) ===
+        removed_products: List[Dict[str, str]] = []
         for p in all_db_products:
-            if p.id in noise_ids:
-                db.delete(p)
-        all_db_products = [p for p in all_db_products if p.id not in noise_ids]
-        logger.info("Task %s: removed %d noise products from DB.", task_id, len(noise_ids))
-
-    # Build fast lookup sets from DB records.
-    db_asins = {p.asin for p in all_db_products if p.asin}
-    db_links = {p.product_link for p in all_db_products}
-
-    # Build fast lookup sets from current scrape.
-    current_asins = {item["asin"] for item in current_products if item.get("asin")}
-    current_links = {item["link"] for item in current_products}
-
-    # New products: in current scrape but never seen before (check ASIN first, then link).
-    new_products: List[Dict[str, str]] = []
-    for item in current_products:
-        asin = item.get("asin", "")
-        is_known = (asin and asin in db_asins) or item["link"] in db_links
-        if not is_known:
-            new_products.append(item)
-            db.add(ProductItem(
-                task_id=task_id,
-                product_link=item["link"],
-                asin=asin or None,
-                name=item["name"],
-            ))
-
-    # Removed products: active in DB but absent from current scrape.
-    removed_products: List[Dict[str, str]] = []
-    for p in all_db_products:
-        if p.removed_at is not None:
-            continue
-        still_present = (
-            (p.asin and p.asin in current_asins)
-            or p.product_link in current_links
+            if p.removed_at is not None:
+                # Already marked as removed, skip
+                continue
+            
+            still_present = (
+                (p.asin and p.asin in current_asins)
+                or p.product_link in current_links
+            )
+            
+            if still_present:
+                # Product found - reset miss count
+                if p.miss_count > 0:
+                    logger.info("Task %s: Product %s found again, resetting miss_count from %d to 0.",
+                                task_id, p.asin or p.product_link[:50], p.miss_count)
+                p.miss_count = 0
+            else:
+                # Product not found - increment miss count
+                p.miss_count = (p.miss_count or 0) + 1
+                logger.warning(
+                    "[ATOMIC] Task %s: Product %s not found (miss_count=%d/%d)",
+                    task_id, p.asin or p.product_link[:50], p.miss_count, MISS_THRESHOLD
+                )
+                
+                if p.miss_count >= MISS_THRESHOLD:
+                    # Confirmed removal after multiple consecutive misses
+                    p.removed_at = now
+                    removed_products.append({"name": p.name, "link": p.product_link})
+                    logger.warning(
+                        "[ATOMIC] Task %s: Product %s CONFIRMED REMOVED after %d consecutive misses.",
+                        task_id, p.asin or p.product_link[:50], MISS_THRESHOLD
+                    )
+        
+        # === DETECT RESTORED PRODUCTS ===
+        for p in all_db_products:
+            if p.removed_at is None:
+                continue
+            is_back = (
+                (p.asin and p.asin in current_asins)
+                or p.product_link in current_links
+            )
+            if is_back:
+                p.removed_at = None
+                p.miss_count = 0
+                logger.info("Task %s: product restored: %s", task_id, p.asin or p.product_link)
+        
+        # Back-fill ASIN for older DB rows
+        _backfill_asins(all_db_products, current_products)
+        
+        # ATOMIC COMMIT - all changes at once
+        db.commit()
+        
+        total_in_db = db.query(ProductItem).filter(
+            ProductItem.task_id == task_id,
+            ProductItem.removed_at.is_(None)
+        ).count()
+        
+        logger.warning(
+            "[ATOMIC] Task %s sync COMPLETE: scraped=%d, new=%d, removed=%d, total_in_db=%d, peak=%d",
+            task_id, len(current_products), len(new_products), len(removed_products), total_in_db,
+            task.peak_product_count or 0,
         )
-        if not still_present:
-            p.removed_at = now
-            removed_products.append({"name": p.name, "link": p.product_link})
-
-    # Restored products: previously removed, now back in stock.
-    for p in all_db_products:
-        if p.removed_at is None:
-            continue
-        is_back = (
-            (p.asin and p.asin in current_asins)
-            or p.product_link in current_links
+        return current_products, new_products, removed_products
+        
+    except Exception as exc:
+        # ATOMIC ROLLBACK - revert all changes on any error
+        db.rollback()
+        logger.error(
+            "[ATOMIC] Task %s sync FAILED - rolled back all changes: %s",
+            task_id, exc
         )
-        if is_back:
-            p.removed_at = None
-            logger.info("Task %s: product restored: %s", task_id, p.asin or p.product_link)
-
-    # Back-fill ASIN for older DB rows that were stored without one.
-    _backfill_asins(all_db_products, current_products)
-
-    db.commit()
-
-    logger.info(
-        "Task %s done. current=%d, new=%d, removed=%d",
-        task_id, len(current_products), len(new_products), len(removed_products),
-    )
-    return current_products, new_products, removed_products
+        raise
 
 
 def _backfill_asins(
@@ -530,7 +688,48 @@ def _backfill_asins(
             p.asin = link_to_asin[p.product_link]
 
 
-_SCRAPE_TIMEOUT = 600  # Max seconds for a single browser scrape.
+_SCRAPE_TIMEOUT = 7200  # Max seconds for a single browser scrape (2 hours).
+_ACTIVITY_TIMEOUT = 180  # Max seconds without any progress (new product captured).
+
+# Thread-safe activity tracking for timeout mechanism.
+_last_activity_time: float = 0.0
+_last_activity_lock = threading.Lock()
+_partial_results: List[Dict[str, str]] = []  # Shared list for partial results.
+_partial_results_lock = threading.Lock()
+
+
+def _update_activity():
+    """Update the last activity timestamp when progress is made."""
+    global _last_activity_time
+    with _last_activity_lock:
+        _last_activity_time = time.time()
+
+
+def _add_partial_result(product: Dict[str, str]):
+    """Add a product to partial results (thread-safe)."""
+    with _partial_results_lock:
+        _partial_results.append(product)
+
+
+def _get_partial_results() -> List[Dict[str, str]]:
+    """Get a copy of partial results."""
+    with _partial_results_lock:
+        return list(_partial_results)
+
+
+def _clear_partial_results():
+    """Clear partial results."""
+    global _partial_results
+    with _partial_results_lock:
+        _partial_results = []
+
+
+def _get_seconds_since_activity() -> float:
+    """Get seconds elapsed since last activity."""
+    with _last_activity_lock:
+        if _last_activity_time == 0:
+            return 0.0
+        return time.time() - _last_activity_time
 
 
 def fetch_products_for_task(db: Session, task_id: int) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]]]:
@@ -552,9 +751,19 @@ def fetch_products_for_task(db: Session, task_id: int) -> Tuple[List[Dict[str, s
 
 
 def _run_browser_scrape_with_timeout(task: MonitorTask) -> List[Dict[str, str]]:
-    """Run the browser scrape in a child thread with a timeout to prevent infinite hangs."""
+    """Run the browser scrape in a child thread with activity-based timeout.
+    
+    The timeout is based on time since last activity (product captured or page visited),
+    not total elapsed time. This allows long scrapes for stores with many products.
+    """
+    global _last_activity_time
     result: List[Dict[str, str]] = []
     error: List[Exception] = []
+
+    # Reset activity tracker and partial results.
+    with _last_activity_lock:
+        _last_activity_time = time.time()
+    _clear_partial_results()
 
     def _target():
         try:
@@ -564,12 +773,37 @@ def _run_browser_scrape_with_timeout(task: MonitorTask) -> List[Dict[str, str]]:
 
     t = threading.Thread(target=_target, daemon=True)
     t.start()
-    t.join(timeout=_SCRAPE_TIMEOUT)
+    
+    # Poll for completion with activity-based timeout.
+    start_time = time.time()
+    while t.is_alive():
+        t.join(timeout=5.0)  # Check every 5 seconds.
+        if not t.is_alive():
+            break
+        
+        elapsed = time.time() - start_time
+        idle_time = _get_seconds_since_activity()
+        
+        # Timeout if no activity for _ACTIVITY_TIMEOUT seconds.
+        if idle_time > _ACTIVITY_TIMEOUT:
+            partial = _get_partial_results()
+            logger.error(
+                "Task %s scrape timed out: no activity for %.0fs (total elapsed: %.0fs). Returning %d partial products.",
+                task.id, idle_time, elapsed, len(partial)
+            )
+            _kill_zombie_browsers()
+            return partial  # Return partial results if any.
+        
+        # Hard limit as fallback (e.g., 10x the activity timeout).
+        if elapsed > _SCRAPE_TIMEOUT:
+            partial = _get_partial_results()
+            logger.warning(
+                "Task %s reached hard timeout of %ds with %d products captured.",
+                task.id, _SCRAPE_TIMEOUT, len(partial)
+            )
+            _kill_zombie_browsers()
+            return partial  # Return partial results.
 
-    if t.is_alive():
-        logger.error("Task %s scrape timed out after %ds.", task.id, _SCRAPE_TIMEOUT)
-        _kill_zombie_browsers()
-        return []
     if error:
         raise error[0]
     return result
@@ -642,12 +876,15 @@ def _create_browser_context(task: MonitorTask):
     parsed = urlparse(task.url)
     base_url = f"{parsed.scheme}://{parsed.netloc}"
     # Pre-warm homepage to set cookies before hitting target.
+    logger.warning("[DEBUG] Pre-warming homepage: %s", base_url)
     try:
         page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
         time.sleep(random.uniform(0.8, 1.6))
+        logger.warning("[DEBUG] Homepage pre-warm completed.")
     except Exception as exc:
-        logger.debug("Pre-warm navigation failed: %s", exc)
+        logger.warning("[DEBUG] Pre-warm navigation failed: %s", exc)
 
+    logger.warning("[DEBUG] Navigating to target URL: %s", task.url)
     if not _navigate_with_retry(page, task.url):
         browser.close()
         pw.stop()
@@ -712,50 +949,77 @@ def _normalize_storefront_tab_url(url: str) -> str:
 def _expand_storefront_menus(page: Page, nav_scope: Locator | None = None) -> None:
     """Best-effort hover to reveal dropdown menu links on storefront pages."""
     scope = nav_scope or page
-    hover_selectors = [
+    # Target dropdown triggers in Amazon storefront navigation
+    dropdown_selectors = [
+        # Amazon storefront specific selectors
+        "button[aria-haspopup='true']",
+        "a[aria-haspopup='true']",
+        "[role='button'][aria-expanded]",
+        # Navigation items with dropdowns (like "DEALS ▼", "LIVING ROOM ▼")
+        "nav a:has-text('▼')",
+        "nav button:has-text('▼')",
+        # Generic dropdown triggers
         "[aria-haspopup='true']",
-        "[role='menuitem']",
-        "button",
-        "li",
-        "ul.stores-tab-list li",
+        "[aria-haspopup='menu']",
+        "[data-action='a]",
     ]
-    hovered = 0
-    max_hovers = 25
-    for selector in hover_selectors:
-        if hovered >= max_hovers:
+    
+    clicked_count = 0
+    max_hovers = 15
+    
+    logger.warning("[DEBUG] Expanding dropdown menus...")
+    
+    for selector in dropdown_selectors:
+        if clicked_count >= max_hovers:
             break
-        locator = scope.locator(selector)
         try:
+            locator = scope.locator(selector)
             count = locator.count()
-        except Exception as exc:
-            logger.debug("Storefront hover discovery failed for %s: %s", selector, exc)
-            continue
-        for idx in range(min(count, max_hovers - hovered)):
-            try:
-                target = locator.nth(idx)
-                target.hover()
-                time.sleep(0.05)
-                try:
-                    target.click(timeout=500)
-                except Exception:
-                    pass
-                hovered += 1
-            except Exception as exc:
-                logger.debug("Storefront hover failed: %s", exc)
+            if count == 0:
                 continue
+            logger.warning("[DEBUG] Found %d elements matching '%s'", count, selector)
+            for idx in range(min(count, max_hovers - clicked_count)):
+                try:
+                    target = locator.nth(idx)
+                    # Only hover to reveal dropdown content - DO NOT click (would navigate away)
+                    target.hover(timeout=2000)
+                    time.sleep(0.5)  # Wait for dropdown to appear
+                    _update_activity()
+                    clicked_count += 1
+                    logger.warning("[DEBUG] Hovered dropdown %d", clicked_count)
+                except Exception as exc:
+                    logger.debug("Dropdown hover failed: %s", exc)
+                    continue
+        except Exception as exc:
+            logger.debug("Dropdown selector '%s' failed: %s", selector, exc)
+            continue
+    
+    logger.warning("[DEBUG] Expanded %d dropdown menus via hover.", clicked_count)
 
 
 def _storefront_nav_scope(page: Page) -> Locator | None:
-    for selector in [
+    """Find the storefront navigation bar element."""
+    # Try various selectors for Amazon storefront navigation
+    nav_selectors = [
+        # Standard nav elements
         "nav[aria-label*='Navigation Bar']",
         "nav[aria-label*='Store']",
         "nav[aria-label*='store']",
-    ]:
-        nav = page.locator(selector)
+        # Amazon storefront specific - the bar with HOME, DEALS, etc.
+        "div[class*='stores-tab']",
+        "ul[class*='stores-tab']",
+        # Generic navigation patterns
+        "nav:has(a:has-text('HOME'))",
+        "div:has(> a:has-text('HOME')):has(> a:has-text('NEW'))",
+    ]
+    for selector in nav_selectors:
         try:
+            nav = page.locator(selector)
             if nav.count():
+                logger.warning("[DEBUG] Found nav scope with selector: %s", selector)
                 return nav.first
-        except Exception:
+        except Exception as exc:
+            logger.debug("Failed to check nav element '%s': %s", selector, exc)
             continue
     return None
 
@@ -764,33 +1028,51 @@ def _discover_storefront_tabs(page: Page, base_url: str) -> List[str]:
     """Find all sub-page links on an Amazon Storefront navigation bar."""
     seen: Set[str] = set()
     tab_urls: List[str] = []
+    
+    logger.warning("[DEBUG] Looking for nav scope...")
     nav_scope = _storefront_nav_scope(page)
+    logger.warning("[DEBUG] Nav scope found: %s", nav_scope is not None)
+    
+    logger.warning("[DEBUG] Expanding storefront menus...")
     _expand_storefront_menus(page, nav_scope)
+    logger.warning("[DEBUG] Menu expansion done.")
 
     for selector in _STOREFRONT_NAV_SELECTORS:
         scope = nav_scope or page
-        anchors = scope.locator(selector).all()
-        if not anchors:
-            continue
-        for a in anchors:
-            try:
-                href = (a.get_attribute("href") or "").strip()
-                if not href:
-                    continue
-                full_url = urljoin(base_url, href)
-                # Only keep Amazon store page URLs.
-                if "/stores/" not in full_url:
-                    continue
-                parsed = urlparse(full_url)
-                canonical = _normalize_storefront_tab_url(full_url)
-                if canonical not in seen:
-                    seen.add(canonical)
-                    tab_urls.append(full_url)
-            except Exception as exc:
-                logger.debug("Storefront tab discovery failed: %s", exc)
+        logger.warning("[DEBUG] Trying selector: %s", selector)
+        try:
+            # Use count() first to avoid slow .all() on large sets
+            locator = scope.locator(selector)
+            count = locator.count()
+            logger.warning("[DEBUG] Selector '%s' matched %d elements", selector, count)
+            if count == 0:
                 continue
+            # Limit to first 50 elements to avoid timeout
+            max_elements = min(count, 50)
+            for idx in range(max_elements):
+                _update_activity()  # Keep alive during discovery
+                try:
+                    a = locator.nth(idx)
+                    href = (a.get_attribute("href") or "").strip()
+                    if not href:
+                        continue
+                    full_url = urljoin(base_url, href)
+                    # Only keep Amazon store page URLs.
+                    if "/stores/" not in full_url:
+                        continue
+                    parsed = urlparse(full_url)
+                    canonical = _normalize_storefront_tab_url(full_url)
+                    if canonical not in seen:
+                        seen.add(canonical)
+                        tab_urls.append(full_url)
+                except Exception as exc:
+                    logger.debug("Storefront tab discovery failed: %s", exc)
+                    continue
+        except Exception as exc:
+            logger.warning("[DEBUG] Selector '%s' failed: %s", selector, exc)
+            continue
 
-    logger.info("Discovered %d storefront tab URLs.", len(tab_urls))
+    logger.warning("[DEBUG] Discovered %d storefront tab URLs.", len(tab_urls))
     return tab_urls
 
 
@@ -802,13 +1084,30 @@ def _collect_asin_links_from_page(
     """Scan all links on the current page for /dp/ASIN patterns."""
     products: List[Dict[str, str]] = []
     anchors = page.locator("a[href*='/dp/'],a[href*='/gp/product/']").all()
-    logger.info("Storefront page: found %d ASIN links.", len(anchors))
+    
+    # First pass: count unique ASINs on this page
+    page_asins: Set[str] = set()
+    for a in anchors:
+        try:
+            href = (a.get_attribute("href") or "").strip()
+            asin_match = AMAZON_ASIN_RE.search(href)
+            if asin_match:
+                page_asins.add(asin_match.group(1).upper())
+        except Exception:
+            pass
+    
+    # Count how many are duplicates from previous pages
+    new_asins = page_asins - seen_asins
+    duplicate_asins = page_asins & seen_asins
+    logger.warning("[DEBUG] Page has %d unique ASINs (%d new, %d already seen from other pages).", 
+                   len(page_asins), len(new_asins), len(duplicate_asins))
 
     for a in anchors:
         try:
             href = (a.get_attribute("href") or "").strip()
             link = _canonicalize_link(base_url, href)
             if _is_noise_link(link):
+                logger.debug("Skipping noise link: %s", link)
                 continue
             asin_match = AMAZON_ASIN_RE.search(link)
             if not asin_match:
@@ -836,10 +1135,13 @@ def _collect_asin_links_from_page(
                 title = f"Amazon Product {asin}"
 
             if _is_noise_title(title):
+                logger.warning("[DEBUG] Skipping noise title: '%s' (ASIN=%s)", title, asin)
                 continue
 
             products.append({"name": title, "link": link, "asin": asin})
-            logger.info("Storefront product captured: %s (ASIN=%s) total=%d.", title, asin, len(seen_asins))
+            _add_partial_result({"name": title, "link": link, "asin": asin})  # Save to partial results.
+            _update_activity()  # Mark progress when product captured.
+            logger.warning("[DEBUG] Storefront product captured: %s (ASIN=%s) total=%d.", title, asin, len(products))
         except Exception as exc:
             logger.debug("Storefront anchor parse failed: %s", exc)
 
@@ -849,10 +1151,13 @@ def _collect_asin_links_from_page(
 def _run_storefront_scrape(task: MonitorTask) -> List[Dict[str, str]]:
     """Scrape an Amazon Storefront by visiting each navigation tab."""
     seen_asins: Set[str] = set()
+    logger.warning("[DEBUG] Starting storefront scrape for task=%s url=%s", task.id, task.url)
     for attempt in range(1, _MAX_CONTEXT_ATTEMPTS + 1):
         _check_cancel()
+        logger.warning("[DEBUG] Storefront context attempt %d/%d", attempt, _MAX_CONTEXT_ATTEMPTS)
         try:
             pw, browser, page, base_url = _create_browser_context(task)
+            logger.warning("[DEBUG] Browser context created successfully for task=%s", task.id)
         except RuntimeError as exc:
             logger.error("%s", exc)
             if attempt < _MAX_CONTEXT_ATTEMPTS:
@@ -860,33 +1165,59 @@ def _run_storefront_scrape(task: MonitorTask) -> List[Dict[str, str]]:
                 continue
             return []
         try:
+            # Wait for page to properly load before scrolling
+            logger.warning("[DEBUG] Waiting for page content to load...")
+            try:
+                # Wait for body to have content
+                page.wait_for_function("document.body.scrollHeight > 100", timeout=15000)
+            except Exception as e:
+                logger.warning("[DEBUG] Page height check failed: %s. Current URL: %s", e, page.url)
+                # Try to wait for any visible content
+                try:
+                    page.wait_for_selector("body *", timeout=10000)
+                except Exception:
+                    pass
+            
+            # Log current page state for debugging
+            current_height = page.evaluate("document.body.scrollHeight")
+            current_url = page.url
+            logger.warning("[DEBUG] Page state before scroll: height=%d, url=%s", current_height, current_url)
+            
             # Collect products from the landing page first.
-            _scroll_to_load(page, rounds=10)
+            logger.warning("[DEBUG] Scrolling to load landing page content...")
+            _scroll_to_load(page, click_show_more=False)  # Don't click buttons that may navigate away
             products = _collect_asin_links_from_page(page, base_url, seen_asins)
-            logger.info("Storefront landing: collected %d products.", len(products))
+            logger.warning("[DEBUG] Storefront landing: collected %d products.", len(products))
 
             # Discover and visit sub-pages.
+            logger.warning("[DEBUG] Discovering storefront tabs...")
             tab_urls = _discover_storefront_tabs(page, base_url)
+            logger.warning("[DEBUG] Discovered %d tab URLs.", len(tab_urls))
             current_url = page.url
-            for tab_url in tab_urls:
+            logger.warning("[DEBUG] Will visit %d storefront tabs (current: %s)", len(tab_urls), current_url)
+            for idx, tab_url in enumerate(tab_urls, 1):
                 _check_cancel()
                 # Skip if it's the same page we already scraped.
                 if urlparse(tab_url).path == urlparse(current_url).path:
+                    logger.debug("Skipping same page: %s", tab_url)
                     continue
+                logger.warning("[DEBUG] Visiting storefront tab %d/%d: %s", idx, len(tab_urls), tab_url)
                 time.sleep(random.uniform(1.5, 3.0))
+                _update_activity()  # Mark activity when visiting each tab (even if 0 new products)
                 if not _navigate_with_retry(page, tab_url):
                     logger.warning("Storefront tab navigation failed: %s", tab_url)
                     continue
                 if _is_blocked(page):
                     logger.error("Blocked on storefront tab: %s", tab_url)
                     break
-                _scroll_to_load(page, rounds=10)
+                _scroll_to_load(page, click_show_more=False)  # Don't click buttons that may navigate away
+                _update_activity()  # Mark activity after scroll completes
                 tab_products = _collect_asin_links_from_page(page, base_url, seen_asins)
                 products.extend(tab_products)
-                logger.info("Storefront tab %s: collected %d products, total=%d.",
-                            tab_url, len(tab_products), len(products))
+                logger.warning("[DEBUG] Tab %d/%d collected %d products, total=%d.",
+                            idx, len(tab_urls), len(tab_products), len(products))
 
-            logger.info("Storefront scrape complete: %d total products.", len(products))
+            logger.warning("[DEBUG] Storefront scrape complete: %d total products.", len(products))
             return products
         finally:
             browser.close()

@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from database import SessionLocal
 from models import MonitorTask, ProductItem, SystemConfig
 try:
-    from scraper import fetch_products_for_task, ScrapeCancelled
+    from scraper import fetch_products_for_task, ScrapeCancelled, ScrapeIncomplete
 except ModuleNotFoundError:
     # Fallback for packaged builds if module resolution fails.
     import importlib.util
@@ -34,6 +34,7 @@ except ModuleNotFoundError:
     _spec.loader.exec_module(_mod)
     fetch_products_for_task = _mod.fetch_products_for_task
     ScrapeCancelled = _mod.ScrapeCancelled
+    ScrapeIncomplete = _mod.ScrapeIncomplete
 from security import decrypt_secret, encrypt_secret, validate_monitor_target_url, EMAIL_RE
 
 logger = logging.getLogger(__name__)
@@ -55,14 +56,22 @@ _pending_digest: list[dict] = []  # [{task_name, new_products, removed_products}
 
 _force_stop_lock = threading.Lock()
 
+# Network failure retry queue
+_retry_queue_lock = threading.Lock()
+_network_retry_queue: list[int] = []  # Task IDs pending retry due to network issues
+_last_network_check: datetime.datetime | None = None
+_network_healthy: bool = True
+
 EMPTY_ALERT_THRESHOLD = 3  # Send health alert after this many consecutive 0-product scrapes.
 DEFAULT_PRODUCT_RETENTION_DAYS = 90
 CLEANUP_JOB_ID = "prune_removed_products"
+NETWORK_CHECK_JOB_ID = "network_check_retry"
 _TASK_RETRY_ATTEMPTS = 2       # How many extra retries if scrape returns nothing.
 _TASK_RETRY_DELAY = (10, 20)   # Random delay (seconds) between retries.
 _INTER_TASK_DELAY = (3, 8)     # Random delay (seconds) between consecutive tasks.
 _SCRAPE_TIMEOUT = 600          # Max seconds for a single scrape attempt.
 _SMTP_RETRY_ATTEMPTS = 2      # Extra retries for email sending.
+_NETWORK_CHECK_INTERVAL_MINUTES = 30  # Check network every 30 minutes when tasks are pending retry
 
 
 def get_inflight_task_ids() -> set[int]:
@@ -73,6 +82,7 @@ def get_inflight_task_ids() -> set[int]:
 def get_queue_snapshot() -> tuple[int | None, list[int]]:
     """Return (currently_running_task_id, [waiting_task_ids])."""
     with _task_state_lock:
+        logger.debug("Queue snapshot: running=%s, waiting=%s", _running_task_id, _queued_task_ids)
         return _running_task_id, list(_queued_task_ids)
 
 
@@ -87,6 +97,128 @@ def _acquire_task_slot(task_id: int) -> bool:
 def _release_task_slot(task_id: int) -> None:
     with _task_state_lock:
         _inflight_task_ids.discard(task_id)
+
+
+# ---------------------------------------------------------------------------
+# Network Retry Queue Management
+# ---------------------------------------------------------------------------
+
+def add_to_retry_queue(task_id: int) -> None:
+    """Add a task to the network retry queue."""
+    with _retry_queue_lock:
+        if task_id not in _network_retry_queue:
+            _network_retry_queue.append(task_id)
+            logger.warning(
+                "[RETRY] Task %s added to network retry queue. Queue size: %d",
+                task_id, len(_network_retry_queue)
+            )
+            # Ensure network check job is scheduled
+            _ensure_network_check_scheduled()
+
+
+def get_retry_queue_snapshot() -> list[int]:
+    """Get a copy of the current retry queue."""
+    with _retry_queue_lock:
+        return list(_network_retry_queue)
+
+
+def _ensure_network_check_scheduled() -> None:
+    """Ensure the network check job is scheduled when there are pending retries."""
+    try:
+        existing = scheduler.get_job(NETWORK_CHECK_JOB_ID)
+        if not existing:
+            scheduler.add_job(
+                _network_check_and_retry,
+                "interval",
+                minutes=_NETWORK_CHECK_INTERVAL_MINUTES,
+                id=NETWORK_CHECK_JOB_ID,
+                replace_existing=True,
+                next_run_time=datetime.datetime.now() + datetime.timedelta(minutes=_NETWORK_CHECK_INTERVAL_MINUTES),
+            )
+            logger.info(
+                "[RETRY] Scheduled network check job every %d minutes.",
+                _NETWORK_CHECK_INTERVAL_MINUTES
+            )
+    except Exception as e:
+        logger.error("[RETRY] Failed to schedule network check job: %s", e)
+
+
+def _check_network_health() -> bool:
+    """Check if Amazon is accessible. Returns True if healthy."""
+    import requests
+    
+    test_urls = [
+        "https://www.amazon.com/robots.txt",
+    ]
+    
+    for url in test_urls:
+        try:
+            resp = requests.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                timeout=15,
+                allow_redirects=True
+            )
+            if resp.status_code == 200:
+                content = resp.text[:500].lower()
+                if "captcha" not in content:
+                    return True
+        except Exception as e:
+            logger.warning("[RETRY] Network check failed for %s: %s", url, e)
+    
+    return False
+
+
+def _network_check_and_retry() -> None:
+    """Periodic job to check network and retry failed tasks."""
+    global _network_healthy, _last_network_check
+    
+    with _retry_queue_lock:
+        pending_count = len(_network_retry_queue)
+        if pending_count == 0:
+            # No pending tasks, remove the job
+            try:
+                scheduler.remove_job(NETWORK_CHECK_JOB_ID)
+                logger.info("[RETRY] No pending tasks, removed network check job.")
+            except:
+                pass
+            return
+    
+    logger.info("[RETRY] Checking network health... (%d tasks pending retry)", pending_count)
+    _last_network_check = datetime.datetime.now(datetime.timezone.utc)
+    
+    is_healthy = _check_network_health()
+    _network_healthy = is_healthy
+    
+    if not is_healthy:
+        logger.warning(
+            "[RETRY] Network still unhealthy. Will retry in %d minutes.",
+            _NETWORK_CHECK_INTERVAL_MINUTES
+        )
+        return
+    
+    logger.info("[RETRY] Network healthy! Requeuing %d failed tasks...", pending_count)
+    
+    # Move all pending tasks to execution queue
+    with _retry_queue_lock:
+        tasks_to_retry = list(_network_retry_queue)
+        _network_retry_queue.clear()
+    
+    for task_id in tasks_to_retry:
+        queue_monitor_task(task_id)
+        logger.info("[RETRY] Task %s requeued for execution.", task_id)
+
+
+def get_network_retry_status() -> dict:
+    """Get status of network retry system for display."""
+    with _retry_queue_lock:
+        return {
+            "pending_count": len(_network_retry_queue),
+            "pending_tasks": list(_network_retry_queue),
+            "network_healthy": _network_healthy,
+            "last_check": _last_network_check.isoformat() if _last_network_check else None,
+            "check_interval_minutes": _NETWORK_CHECK_INTERVAL_MINUTES,
+        }
 
 
 def _clean_subject_text(value: str) -> str:
@@ -156,10 +288,12 @@ def _render_product_table(
     header_bg: str,
     text_color: str,
     link_color: str,
+    max_items: int = 50,
 ) -> str:
-    """Return an HTML table string for a list of products."""
+    """Return an HTML table string for a list of products (limited to max_items)."""
+    display_products = products[:max_items]
     rows = []
-    for p in products:
+    for p in display_products:
         safe_name = escape((p.get("name") or "").strip(), quote=False)
         safe_href = _safe_link_for_html(p.get("link") or "")
         rows.append(
@@ -167,6 +301,13 @@ def _render_product_table(
             f"<td style='padding:10px;border:1px solid #e5e7eb;color:{text_color};'>{safe_name}</td>"
             f"<td style='padding:10px;border:1px solid #e5e7eb;'>"
             f"<a href='{safe_href}' style='color:{link_color};'>查看商品</a></td></tr>"
+        )
+    # Add "more items" row if truncated
+    if len(products) > max_items:
+        remaining = len(products) - max_items
+        rows.append(
+            f"<tr><td colspan='2' style='padding:10px;border:1px solid #e5e7eb;color:#6b7280;text-align:center;'>"
+            f"还有 {remaining} 个商品未显示...</td></tr>"
         )
     return (
         f"<table style='width:100%;border-collapse:collapse;margin-bottom:20px;'>"
@@ -178,15 +319,88 @@ def _render_product_table(
 
 
 def _smtp_send(config: SystemConfig, smtp_password: str, msg: MIMEText, recipients: list[str]) -> None:
+    import ssl
     last_exc: Exception | None = None
+    
+    logger.warning("[DEBUG] SMTP config: server=%s, port=%d, sender=%s, recipients=%s",
+                   config.smtp_server, config.smtp_port, config.sender_email, recipients)
+    
     for attempt in range(1 + _SMTP_RETRY_ATTEMPTS):
         try:
-            with smtplib.SMTP_SSL(config.smtp_server, config.smtp_port, timeout=30) as server:
-                server.login(config.sender_email, smtp_password)
-                server.send_message(msg, to_addrs=recipients)
+            # Create SSL context - try different settings based on attempt
+            context = ssl.create_default_context()
+            
+            # On retry, try more relaxed SSL settings
+            if attempt > 0:
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                logger.warning("[DEBUG] Using relaxed SSL settings for retry")
+            
+            # Port 465 = SMTP_SSL (direct SSL connection)
+            # Port 587 = STARTTLS (upgrade plain connection to TLS)
+            if config.smtp_port == 465:
+                logger.warning("[DEBUG] Using SMTP_SSL for port %d", config.smtp_port)
+                with smtplib.SMTP_SSL(config.smtp_server, config.smtp_port, timeout=120, context=context) as server:
+                    server.set_debuglevel(0)  # Disable verbose debug to avoid blocking
+                    logger.warning("[DEBUG] SSL connected, logging in as %s...", config.sender_email)
+                    server.login(config.sender_email, smtp_password)
+                    logger.warning("[DEBUG] Login successful, sending message...")
+                    server.send_message(msg, to_addrs=recipients)
+            elif config.smtp_port == 587:
+                # Use STARTTLS for port 587
+                logger.warning("[DEBUG] Using SMTP+STARTTLS for port %d", config.smtp_port)
+                with smtplib.SMTP(config.smtp_server, config.smtp_port, timeout=120) as server:
+                    server.set_debuglevel(0)  # Disable verbose debug to avoid blocking
+                    logger.warning("[DEBUG] Connected, sending EHLO...")
+                    server.ehlo()
+                    logger.warning("[DEBUG] EHLO done, starting TLS...")
+                    server.starttls(context=context)
+                    logger.warning("[DEBUG] TLS started, sending EHLO again...")
+                    server.ehlo()
+                    logger.warning("[DEBUG] Logging in as %s...", config.sender_email)
+                    server.login(config.sender_email, smtp_password)
+                    logger.warning("[DEBUG] Login successful, sending message...")
+                    server.send_message(msg, to_addrs=recipients)
+            else:
+                # For other ports, try plain SMTP first
+                logger.warning("[DEBUG] Using plain SMTP for port %d", config.smtp_port)
+                with smtplib.SMTP(config.smtp_server, config.smtp_port, timeout=60) as server:
+                    server.set_debuglevel(0)
+                    server.ehlo()
+                    if server.has_extn('STARTTLS'):
+                        server.starttls(context=context)
+                        server.ehlo()
+                    server.login(config.sender_email, smtp_password)
+                    server.send_message(msg, to_addrs=recipients)
+            
+            logger.warning("[DEBUG] Email sent successfully!")
             return
+        except ssl.SSLError as exc:
+            last_exc = exc
+            logger.error("SMTP SSL error: %s", exc)
+            # If SSL error on port 465, try port 587 with STARTTLS as fallback
+            if config.smtp_port == 465 and attempt == 0:
+                logger.warning("[DEBUG] SSL error on port 465, trying port 587 with STARTTLS...")
+                try:
+                    ctx587 = ssl.create_default_context()
+                    with smtplib.SMTP(config.smtp_server, 587, timeout=60) as server:
+                        server.ehlo()
+                        server.starttls(context=ctx587)
+                        server.ehlo()
+                        server.login(config.sender_email, smtp_password)
+                        server.send_message(msg, to_addrs=recipients)
+                    logger.warning("[DEBUG] Email sent successfully via port 587!")
+                    return
+                except Exception as e587:
+                    logger.warning("[DEBUG] Port 587 also failed: %s", e587)
+            if attempt < _SMTP_RETRY_ATTEMPTS:
+                wait = 5 * (attempt + 1)
+                logger.warning("SMTP send failed (attempt %d/%d), retrying in %ds: %s",
+                               attempt + 1, 1 + _SMTP_RETRY_ATTEMPTS, wait, exc)
+                time.sleep(wait)
         except Exception as exc:
             last_exc = exc
+            logger.error("SMTP error details: %s: %s", type(exc).__name__, exc)
             if attempt < _SMTP_RETRY_ATTEMPTS:
                 wait = 5 * (attempt + 1)
                 logger.warning("SMTP send failed (attempt %d/%d), retrying in %ds: %s",
@@ -346,19 +560,60 @@ def execute_monitor_task(task_id: int):
 
 
 def _fetch_with_retry(db, task_id: int, task_name: str):
-    """Attempt scrape up to 1 + _TASK_RETRY_ATTEMPTS times, retrying on empty results."""
+    """Attempt scrape up to 1 + _TASK_RETRY_ATTEMPTS times, retrying on empty results.
+    
+    If ScrapeIncomplete is raised (network issue), adds task to retry queue.
+    Returns (current_products, new_products, removed_products) or raises ScrapeIncomplete.
+    """
+    from scraper import ScrapeCancelled, ScrapeIncomplete
+    
     for attempt in range(1 + _TASK_RETRY_ATTEMPTS):
-        current, new_prods, removed_prods = fetch_products_for_task(db, task_id)
-        if current:
+        try:
+            current, new_prods, removed_prods = fetch_products_for_task(db, task_id)
+            # Success - return results
             return current, new_prods, removed_prods
-        if attempt < _TASK_RETRY_ATTEMPTS:
+            
+        except ScrapeCancelled:
+            logger.warning("Task %s was cancelled, not retrying.", task_name)
+            return [], [], []
+            
+        except ScrapeIncomplete as e:
+            logger.warning(
+                "[RETRY] Task %s scrape incomplete (attempt %d/%d): %s",
+                task_name, attempt + 1, 1 + _TASK_RETRY_ATTEMPTS, e
+            )
+            # On last attempt, add to retry queue and re-raise
+            if attempt >= _TASK_RETRY_ATTEMPTS:
+                logger.warning(
+                    "[RETRY] Task %s failed all %d attempts - adding to network retry queue.",
+                    task_name, 1 + _TASK_RETRY_ATTEMPTS
+                )
+                add_to_retry_queue(task_id)
+                raise  # Re-raise to signal failure
+            
+            # Check if cancelled before retrying
+            from scraper import _cancel_event
+            if _cancel_event.is_set():
+                logger.warning("Task %s retry cancelled by user.", task_name)
+                _cancel_event.clear()
+                return [], [], []
+            
+            # Wait before retry
             delay = random.uniform(*_TASK_RETRY_DELAY)
             logger.warning(
-                "Task %s returned 0 products (attempt %d/%d), retrying in %.0fs...",
-                task_name, attempt + 1, 1 + _TASK_RETRY_ATTEMPTS, delay,
+                "Task %s incomplete, retrying in %.0fs...",
+                task_name, delay
             )
             time.sleep(delay)
-    return current, new_prods, removed_prods
+            
+        except Exception as e:
+            logger.error("Task %s unexpected error: %s", task_name, e)
+            if attempt >= _TASK_RETRY_ATTEMPTS:
+                raise
+            time.sleep(random.uniform(*_TASK_RETRY_DELAY))
+    
+    # Should not reach here, but return empty if we do
+    return [], [], []
 
 
 def _execute_monitor_task_locked(task_id: int):
@@ -385,6 +640,15 @@ def _execute_monitor_task_locked(task_id: int):
         logger.warning("Task %s cancelled by user.", task_id)
         return
     except Exception as exc:
+        # Check if it's a ScrapeIncomplete - already handled in _fetch_with_retry
+        from scraper import ScrapeIncomplete
+        if isinstance(exc, ScrapeIncomplete):
+            logger.warning(
+                "[RETRY] Task %s incomplete due to network issue - will retry later.",
+                task_id
+            )
+            # Don't update any state - task is in retry queue
+            return
         logger.error("Error executing task %s: %s", task_id, exc)
     finally:
         db.close()
@@ -448,24 +712,35 @@ def _handle_successful_scrape(db, task, current, new_prods, removed_prods, is_fi
             "Task %s: new=%d, removed=%d, queuing for digest.",
             task.name, len(new_prods), len(removed_prods),
         )
-        _queue_digest_entry(task.name, new_prods, removed_prods)
+        _queue_digest_entry(task.name, new_prods, removed_prods, is_baseline=False)
     elif is_first_successful_run:
         logger.info(
             "Task %s: baseline scrape completed with %d products. Queuing initial digest.",
             task.name,
             len(current),
         )
-        _queue_digest_entry(task.name, current, [])
+        # Only send count for baseline, not full product list (email would be too large)
+        _queue_digest_entry(task.name, [], [], is_baseline=True, baseline_count=len(current))
     else:
         logger.info("Task %s: no changes detected.", task.name)
 
 
-def _queue_digest_entry(task_name: str, new_products: list, removed_products: list) -> None:
+def _queue_digest_entry(
+    task_name: str,
+    new_products: list,
+    removed_products: list,
+    is_baseline: bool = False,
+    baseline_count: int = 0,
+) -> None:
+    logger.warning("[DEBUG] Queuing digest entry: task=%s, new=%d, removed=%d, baseline=%s", 
+                   task_name, len(new_products), len(removed_products), is_baseline)
     with _digest_lock:
         _pending_digest.append({
             "task_name": task_name,
             "new_products": list(new_products),
             "removed_products": list(removed_products),
+            "is_baseline": is_baseline,
+            "baseline_count": baseline_count,
         })
 
 
@@ -473,9 +748,12 @@ def _flush_digest() -> None:
     """Send one consolidated email for all accumulated changes, then clear the list."""
     with _digest_lock:
         if not _pending_digest:
+            logger.warning("[DEBUG] No pending digest entries to send.")
             return
         entries = list(_pending_digest)
         _pending_digest.clear()
+    
+    logger.warning("[DEBUG] Flushing digest with %d entries.", len(entries))
 
     db = SessionLocal()
     try:
@@ -497,6 +775,8 @@ def _send_consolidated_email(db: Session, entries: list[dict]) -> None:
     if not all_recipients:
         logger.error("No recipients found for consolidated digest.")
         return
+    
+    logger.warning("[DEBUG] Recipients: %s", all_recipients)
 
     config = db.query(SystemConfig).first()
     if not config or not config.sender_email:
@@ -506,15 +786,23 @@ def _send_consolidated_email(db: Session, entries: list[dict]) -> None:
     if not smtp_password:
         logger.error("SMTP password not configured.")
         return
+    
+    logger.warning("[DEBUG] SMTP configured: server=%s, port=%s, sender=%s", 
+                   config.smtp_server, config.smtp_port, config.sender_email)
 
     total_new = sum(len(e["new_products"]) for e in entries)
     total_removed = sum(len(e["removed_products"]) for e in entries)
+    total_baseline = sum(1 for e in entries if e.get("is_baseline"))
+    total_baseline_products = sum(e.get("baseline_count", 0) for e in entries if e.get("is_baseline"))
+    
     subject_parts = []
+    if total_baseline:
+        subject_parts.append(f"{total_baseline} 个店铺初始化完成")
     if total_new:
         subject_parts.append(f"{total_new} 新上架")
     if total_removed:
         subject_parts.append(f"{total_removed} 已下架")
-    subject = f"[Monitor] 综合报告: {', '.join(subject_parts)} (涉及 {len(entries)} 个店铺)"
+    subject = f"[Monitor] 综合报告: {', '.join(subject_parts)}"
 
     sections = [
         "<div style='font-family:sans-serif;padding:20px;'>",
@@ -526,14 +814,26 @@ def _send_consolidated_email(db: Session, entries: list[dict]) -> None:
         safe_name = escape(entry["task_name"], quote=False)
         sections.append(f"<hr style='border:none;border-top:1px solid #e5e7eb;margin:24px 0'>")
         sections.append(f"<h3>{safe_name}</h3>")
+        
+        # Baseline initialization: only show count, not full product list
+        if entry.get("is_baseline"):
+            baseline_count = entry.get("baseline_count", 0)
+            sections.append(
+                f"<p style='color:#16a34a;font-size:16px;'>"
+                f"✓ 店铺初始化成功，共抓取到 <b>{baseline_count}</b> 个商品</p>"
+            )
+            sections.append(
+                "<p style='color:#6b7280;font-size:14px;'>"
+                "后续抓取如有新上架或下架商品，将会在邮件中详细列出。</p>"
+            )
+            continue
+        
         if entry["new_products"]:
             sections.append(f"<h4 style='color:#16a34a;'>新上架 ({len(entry['new_products'])})</h4>")
             sections.append(_render_product_table(entry["new_products"], "#f0fdf4", "#111111", "#4f46e5"))
         if entry["removed_products"]:
             sections.append(f"<h4 style='color:#dc2626;'>已下架 ({len(entry['removed_products'])})</h4>")
             sections.append(_render_product_table(entry["removed_products"], "#fef2f2", "#6b7280", "#6b7280"))
-        if not entry["new_products"] and not entry["removed_products"]:
-            sections.append("<p style='color:#6b7280;'>初始基线数据已建立。</p>")
 
     sections.append("</div>")
 

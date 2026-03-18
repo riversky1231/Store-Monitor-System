@@ -41,6 +41,9 @@
 {% if request.query_params.get('batch_deleted') %}
 <div class="alert alert-ok">已批量删除 <strong>{{ request.query_params.get('batch_deleted') }}</strong> 个店铺。</div>
 {% endif %}
+{% if request.query_params.get('batch_updated') %}
+<div class="alert alert-ok">已将 <strong>{{ request.query_params.get('batch_updated') }}</strong> 个店铺的检查频率修改为 {{ request.query_params.get('new_interval') }} 小时。</div>
+{% endif %}
 {% if request.query_params.get('claimed') %}
 <div class="alert alert-ok">已从待分配列表导入 <strong>{{ request.query_params.get('claimed') }}</strong> 个店铺到本分组。</div>
 {% endif %}
@@ -68,6 +71,10 @@
   <!-- Batch action bar — hidden until checkboxes are ticked -->
   <div id="batchBar" class="batch-bar" style="display:none">
     <span id="batchCount">已选 0 项</span>
+    <button class="btn btn-ghost" onclick="openBatchInterval()" style="font-size:13px">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      批量改频率
+    </button>
     <button class="btn btn-ghost" onclick="openBatchMove()" style="font-size:13px">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" stroke-linecap="round" stroke-linejoin="round"/></svg>
       移动到…
@@ -134,7 +141,7 @@
               检索中…
             </span>
             {% elif task.is_active and task.next_run_at %}
-            {{ task.next_run_at.strftime('%m-%d %H:%M') }}
+            {{ task.next_run_at|beijing }}
             {% else %}—{% endif %}
           </td>
           <td>
@@ -337,6 +344,31 @@
   </div>
 </div>
 
+<!-- 批量修改频率 Modal -->
+<div id="intervalM" class="overlay">
+  <div class="modal" style="max-width:420px">
+    <div class="modal-hd">
+      <h3>批量修改检查频率</h3>
+      <button class="modal-x" onclick="closeM('intervalM')">×</button>
+    </div>
+    <div class="modal-bd">
+      <form id="intervalF" method="post" action="/tasks/batch-update-interval">
+        <input type="hidden" name="source_group_id" value="{{ group.id }}">
+        <div id="intervalTaskInputs"></div>
+        <div class="form-blk">
+          <label>新的检查频率（小时）</label>
+          <input type="number" name="new_interval" class="inp" value="24" min="1" max="168" required>
+          <div class="hint">将所选任务的检查频率统一修改为此值</div>
+        </div>
+      </form>
+    </div>
+    <div class="modal-ft">
+      <button class="btn btn-ghost" onclick="closeM('intervalM')">取消</button>
+      <button class="btn btn-primary" onclick="document.getElementById('intervalF').submit()">确认修改</button>
+    </div>
+  </div>
+</div>
+
 <!-- 从待分配列表选择 Modal -->
 {% if pending_imports %}
 <div id="pendingM" class="overlay">
@@ -459,6 +491,18 @@ function openBatchMove() {
   document.getElementById('moveTitle').textContent = '批量移动 ' + ids.length + ' 个店铺';
   _fillMoveInputs(ids);
   openM('moveM');
+}
+function openBatchInterval() {
+  const ids = getCheckedIds();
+  if (!ids.length) return;
+  const container = document.getElementById('intervalTaskInputs');
+  container.innerHTML = '';
+  ids.forEach(function(id) {
+    var inp = document.createElement('input');
+    inp.type = 'hidden'; inp.name = 'task_ids'; inp.value = id;
+    container.appendChild(inp);
+  });
+  openM('intervalM');
 }
 function openSingleMove(taskId, taskName) {
   document.getElementById('moveF').action = '/tasks/batch-move';

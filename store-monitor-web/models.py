@@ -49,6 +49,7 @@ class MonitorTask(Base):
     health_state = Column(String, default="healthy")  # healthy|warning|alert
     last_health_alert_at = Column(DateTime(timezone=True), nullable=True)
     last_recovery_at = Column(DateTime(timezone=True), nullable=True)
+    peak_product_count = Column(Integer, default=0)  # Historical max product count for integrity check
 
     group = relationship("Category", back_populates="tasks")
     products = relationship("ProductItem", back_populates="task", cascade="all, delete-orphan")
@@ -78,5 +79,6 @@ class ProductItem(Base):
     name = Column(String)
     discovered_at = Column(DateTime(timezone=True), server_default=func.now())
     removed_at = Column(DateTime(timezone=True), nullable=True)  # set when product disappears from store
+    miss_count = Column(Integer, default=0)  # Consecutive times not detected (for removal confirmation)
 
     task = relationship("MonitorTask", back_populates="products")

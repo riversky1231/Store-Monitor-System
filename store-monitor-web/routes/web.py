@@ -13,6 +13,7 @@ from database import get_db
 from models import Category, MonitorTask, PendingImport, SystemConfig, ProductItem
 from scheduler import (
     EMPTY_ALERT_THRESHOLD,
+    force_stop_queue,
     get_inflight_task_ids,
     get_queue_snapshot,
     queue_monitor_task,
@@ -31,14 +32,32 @@ router = APIRouter(dependencies=[Depends(require_admin_auth)])
 public_router = APIRouter()  # No auth — used for setup wizard.
 templates = Jinja2Templates(directory=get_resource_path("templates"))
 
+# Add custom filter to convert UTC to Beijing time (UTC+8)
+import datetime as _dt
+def _to_beijing_time(dt):
+    """Convert UTC datetime to Beijing time (UTC+8)."""
+    if dt is None:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_dt.timezone.utc)
+    beijing_tz = _dt.timezone(_dt.timedelta(hours=8))
+    beijing_dt = dt.astimezone(beijing_tz)
+    return beijing_dt.strftime('%m-%d %H:%M')
+
+templates.env.filters["beijing"] = _to_beijing_time
+
 _TASKS_PAGE_SIZE = 10
 _IMPORT_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 
 
-def _group_error_redirect(group_id: int, message: str) -> RedirectResponse:
+def _group_error_redirect(group_id: int | None, message: str) -> RedirectResponse:
+    if group_id:
+        return RedirectResponse(
+            url=f"/tasks/group/{group_id}?error={quote(message)}", status_code=303,
+        )
     return RedirectResponse(
-        url=f"/tasks/group/{group_id}?error={quote(message)}", status_code=303,
+        url=f"/tasks?error={quote(message)}", status_code=303,
     )
 
 
@@ -200,6 +219,16 @@ async def run_all_tasks(db: Session = Depends(get_db)):
         if queue_monitor_task(task.id):
             queued += 1
     return RedirectResponse(url=f"/tasks?run_all=1&queued={queued}", status_code=303)
+
+
+@router.post("/tasks/queue/stop")
+async def stop_queue():
+    """Force stop the running task and clear the queue."""
+    running_id, cleared = force_stop_queue()
+    parts = ["queue_stopped=1", f"cleared={cleared}"]
+    if running_id is not None:
+        parts.append(f"running={running_id}")
+    return RedirectResponse(url="/tasks?" + "&".join(parts), status_code=303)
 
 
 # ---------------------------------------------------------------------------
@@ -526,7 +555,14 @@ async def add_task(
     db.commit()
     db.refresh(new_task)
     schedule_task(new_task)
-    return RedirectResponse(url=f"/tasks/group/{group_id}", status_code=303)
+    
+    # Calculate which page the new task is on and redirect there
+    total_tasks = db.query(MonitorTask).filter(MonitorTask.category_id == group_id).count()
+    last_page = (total_tasks + _TASKS_PAGE_SIZE - 1) // _TASKS_PAGE_SIZE
+    return RedirectResponse(
+        url=f"/tasks/group/{group_id}?page={last_page}&highlight={new_task.id}",
+        status_code=303
+    )
 
 
 @router.post("/tasks/{task_id}/edit")
@@ -552,24 +588,21 @@ async def edit_task(
         "storefront-auto" if resolved_type == "storefront"
         else "div[data-component-type='s-search-result']"
     )
-    if gid and not task_name:
+    if not task_name:
         return _group_error_redirect(gid, "任务名称不能为空。")
-    if gid and resolved_type == "search" and not css_selector:
+    if resolved_type == "search" and not css_selector:
         return _group_error_redirect(gid, "CSS 选择器不能为空。")
     dup = db.query(MonitorTask).filter(MonitorTask.name == task_name, MonitorTask.id != task_id).first()
-    if gid and dup:
+    if dup:
         return _group_error_redirect(gid, f"店铺名称「{task_name}」已存在，请使用不同的名称。")
     if check_interval_hours < 1 or check_interval_hours > 168:
-        if gid:
-            return _group_error_redirect(gid, "检查频率必须在 1-168 小时之间。")
+        return _group_error_redirect(gid, "检查频率必须在 1-168 小时之间。")
 
     try:
         target_url = validate_monitor_target_url(url)
         recipients_value = normalize_recipients(recipients)
     except ValueError as exc:
-        if gid:
-            return _group_error_redirect(gid, str(exc))
-        return RedirectResponse(url="/tasks", status_code=303)
+        return _group_error_redirect(gid, str(exc))
 
     config_changed = task.url != target_url or task.selector != css_selector or task.task_type != resolved_type
     task.name = task_name
@@ -674,6 +707,41 @@ async def batch_delete_tasks(
     db.commit()
     return RedirectResponse(
         url=f"/tasks/group/{source_group_id}?batch_deleted={deleted}",
+        status_code=303,
+    )
+
+
+@router.post("/tasks/batch-update-interval")
+async def batch_update_interval(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Batch update check interval for selected tasks."""
+    form = await request.form()
+    task_ids_raw = form.getlist("task_ids")
+    source_group_id = int(form.get("source_group_id", 0))
+    new_interval = int(form.get("new_interval", 24))
+    
+    if new_interval < 1 or new_interval > 168:
+        return _group_error_redirect(source_group_id, "检查频率必须在 1-168 小时之间。")
+    
+    updated = 0
+    for raw_id in task_ids_raw:
+        try:
+            tid = int(raw_id)
+        except (ValueError, TypeError):
+            continue
+        task = db.query(MonitorTask).filter(MonitorTask.id == tid).first()
+        if task:
+            task.check_interval_hours = new_interval
+            # Re-schedule the task with new interval
+            remove_scheduled_task(task.id)
+            schedule_task(task)
+            updated += 1
+    
+    db.commit()
+    return RedirectResponse(
+        url=f"/tasks/group/{source_group_id}?batch_updated={updated}&new_interval={new_interval}",
         status_code=303,
     )
 
@@ -790,6 +858,119 @@ async def queue_status(db: Session = Depends(get_db)):
         items.append({"id": tid, "name": task.name if task else f"Task-{tid}", "status": "waiting"})
 
     return JSONResponse({"items": items, "total": len(items)})
+
+
+# ---------------------------------------------------------------------------
+# Network Check API (test if Amazon is accessible)
+# ---------------------------------------------------------------------------
+
+@router.get("/api/network-check")
+async def network_check():
+    """Check if Amazon is accessible and measure response time."""
+    import time
+    import requests
+    import asyncio
+    
+    def _do_check():
+        results = {
+            "success": False,
+            "message": "",
+            "response_time_ms": None,
+            "details": []
+        }
+        
+        test_urls = [
+            ("https://www.amazon.com", "Amazon 主站"),
+            ("https://www.amazon.com/robots.txt", "Amazon robots.txt"),
+        ]
+        
+        all_ok = True
+        total_time = 0
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        
+        for url, name in test_urls:
+            try:
+                start = time.time()
+                resp = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+                elapsed = (time.time() - start) * 1000
+                total_time += elapsed
+                
+                status = resp.status_code
+                if status == 200:
+                    content = resp.text[:2000].lower()
+                    if "captcha" in content or ("robot" in content and "robots.txt" not in url):
+                        results["details"].append({
+                            "name": name,
+                            "status": "⚠️ 可能被限制",
+                            "time_ms": round(elapsed),
+                            "note": "检测到验证码/机器人检查"
+                        })
+                        all_ok = False
+                    else:
+                        results["details"].append({
+                            "name": name,
+                            "status": "✅ 正常",
+                            "time_ms": round(elapsed),
+                            "note": ""
+                        })
+                elif status == 503:
+                    results["details"].append({
+                        "name": name,
+                        "status": "⚠️ 服务不可用",
+                        "time_ms": round(elapsed),
+                        "note": f"HTTP {status} - 可能被临时限制"
+                    })
+                    all_ok = False
+                else:
+                    results["details"].append({
+                        "name": name,
+                        "status": "✅ 可访问",
+                        "time_ms": round(elapsed),
+                        "note": f"HTTP {status}"
+                    })
+            except requests.Timeout:
+                results["details"].append({
+                    "name": name,
+                    "status": "❌ 超时",
+                    "time_ms": None,
+                    "note": "连接超时 (>15s)"
+                })
+                all_ok = False
+            except Exception as e:
+                results["details"].append({
+                    "name": name,
+                    "status": "❌ 失败",
+                    "time_ms": None,
+                    "note": str(e)[:50]
+                })
+                all_ok = False
+        
+        if total_time > 0:
+            results["response_time_ms"] = round(total_time / len(test_urls))
+        
+        if all_ok:
+            avg_time = results["response_time_ms"] or 0
+            if avg_time < 500:
+                results["success"] = True
+                results["message"] = f"✅ 网络状态良好！平均响应 {avg_time}ms，适合抓取。"
+            elif avg_time < 2000:
+                results["success"] = True
+                results["message"] = f"⚠️ 网络较慢，平均响应 {avg_time}ms，可以抓取但可能较慢。"
+            else:
+                results["success"] = False
+                results["message"] = f"⚠️ 网络很慢，平均响应 {avg_time}ms，建议稍后再试。"
+        else:
+            results["success"] = False
+            results["message"] = "❌ 网络连接异常，请检查代理设置或稍后再试。"
+        
+        return results
+    
+    # Run blocking code in thread pool
+    import asyncio
+    results = await asyncio.to_thread(_do_check)
+    return JSONResponse(results)
 
 
 # ---------------------------------------------------------------------------

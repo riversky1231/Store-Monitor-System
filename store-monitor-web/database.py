@@ -34,7 +34,7 @@ def _run_alembic_migrations() -> bool:
     try:
         from alembic import command
         from alembic.config import Config
-    except Exception:
+    except ImportError:
         return False
 
     root_dir = Path(__file__).resolve().parent
