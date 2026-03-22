@@ -30,25 +30,25 @@
 {% endif %}
 {% if request.query_params.get('import_ok') %}
 <div class="alert alert-ok">
-  导入完成：成功导入 <strong>{{ request.query_params.get('imported') }}</strong> 条，跳过 {{ request.query_params.get('skipped') }} 条。
+  导入完成：成功导入 <strong>{{ request.query_params.get('imported') | e }}</strong> 条，跳过 {{ request.query_params.get('skipped') | e }} 条。
 </div>
 {% endif %}
 {% if request.query_params.get('batch_moved') %}
 <div class="alert alert-ok">
-  已将 <strong>{{ request.query_params.get('batch_moved') }}</strong> 个店铺移动到「{{ request.query_params.get('target_name') }}」。
+  已将 <strong>{{ request.query_params.get('batch_moved') | e }}</strong> 个店铺移动到「{{ request.query_params.get('target_name') | e }}」。
 </div>
 {% endif %}
 {% if request.query_params.get('batch_deleted') %}
-<div class="alert alert-ok">已批量删除 <strong>{{ request.query_params.get('batch_deleted') }}</strong> 个店铺。</div>
+<div class="alert alert-ok">已批量删除 <strong>{{ request.query_params.get('batch_deleted') | e }}</strong> 个店铺。</div>
 {% endif %}
 {% if request.query_params.get('batch_updated') %}
-<div class="alert alert-ok">已将 <strong>{{ request.query_params.get('batch_updated') }}</strong> 个店铺的检查频率修改为 {{ request.query_params.get('new_interval') }} 小时。</div>
+<div class="alert alert-ok">已将 <strong>{{ request.query_params.get('batch_updated') | e }}</strong> 个店铺的检查频率修改为 {{ request.query_params.get('new_interval') | e }} 小时。</div>
 {% endif %}
 {% if request.query_params.get('claimed') %}
-<div class="alert alert-ok">已从待分配列表导入 <strong>{{ request.query_params.get('claimed') }}</strong> 个店铺到本分组。</div>
+<div class="alert alert-ok">已从待分配列表导入 <strong>{{ request.query_params.get('claimed') | e }}</strong> 个店铺到本分组。</div>
 {% endif %}
 {% if request.query_params.get('error') %}
-<div class="alert alert-err">{{ request.query_params.get('error') }}</div>
+<div class="alert alert-err">{{ request.query_params.get('error') | e }}</div>
 {% endif %}
 
 <div class="card">

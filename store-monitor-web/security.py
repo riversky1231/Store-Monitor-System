@@ -15,12 +15,19 @@ from urllib.parse import urlparse
 
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from utils import get_runtime_base_path
 
 try:
     from cryptography.fernet import Fernet, InvalidToken
 except ImportError:  # pragma: no cover - runtime fallback when optional dep is missing
     Fernet = None
     InvalidToken = Exception
+
+try:
+    from email_validator import validate_email as _validate_email_lib, EmailNotValidError
+    _EMAIL_VALIDATOR_AVAILABLE = True
+except ImportError:  # pragma: no cover - fallback to regex if library not installed
+    _EMAIL_VALIDATOR_AVAILABLE = False
 
 
 logger = logging.getLogger(__name__)
@@ -46,7 +53,19 @@ COMPAT_PROXY_NETWORKS = (
     ipaddress.ip_network("198.18.0.0/15"),
 )
 
+# 保留正则作为 email-validator 不可用时的回退
 EMAIL_RE = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
+
+
+def is_valid_email(email: str) -> bool:
+    """验证邮件地址格式。优先使用 email-validator 库，不可用时回退到正则。"""
+    if _EMAIL_VALIDATOR_AVAILABLE:
+        try:
+            _validate_email_lib(email, check_deliverability=False)
+            return True
+        except EmailNotValidError:
+            return False
+    return bool(EMAIL_RE.fullmatch(email))
 
 _fernet_client = None
 _fernet_lock = threading.Lock()
@@ -263,7 +282,7 @@ def normalize_recipients(raw_value: str) -> str:
             continue
         if "\r" in email or "\n" in email:
             raise ValueError("Recipient email contains invalid control characters.")
-        if not EMAIL_RE.fullmatch(email):
+        if not is_valid_email(email):
             raise ValueError(f"Invalid recipient email format: {email}")
         recipients.append(email)
 
@@ -451,26 +470,34 @@ def _load_or_create_secret_key() -> bytes:
     if configured_key_path:
         return _read_or_create_key_at(Path(configured_key_path))
 
-    default_key_path = Path.cwd() / SMTP_SECRET_FILE_DEFAULT
-    if default_key_path.exists():
-        return default_key_path.read_bytes().strip()
+    runtime_default_key_path = get_runtime_base_path() / SMTP_SECRET_FILE_DEFAULT
+    if runtime_default_key_path.exists():
+        return runtime_default_key_path.read_bytes().strip()
 
-    # Compatibility: migrate legacy key locations to the stable working-directory path.
+    cwd_default_key_path = Path.cwd() / SMTP_SECRET_FILE_DEFAULT
+    if cwd_default_key_path.exists():
+        key_bytes = cwd_default_key_path.read_bytes().strip()
+        if key_bytes and cwd_default_key_path != runtime_default_key_path:
+            _write_key_file(runtime_default_key_path, key_bytes)
+        return key_bytes
+
+    # Compatibility: migrate legacy key locations to the stable runtime path.
     legacy_paths = []
     if getattr(sys, "frozen", False):
         legacy_paths.append(Path(sys.executable).resolve().parent / SMTP_SECRET_FILE_DEFAULT)
     legacy_paths.append(Path(__file__).resolve().parent / SMTP_SECRET_FILE_DEFAULT)
+    legacy_paths.append(cwd_default_key_path)
 
     for legacy_path in legacy_paths:
-        if legacy_path == default_key_path or not legacy_path.exists():
+        if legacy_path == runtime_default_key_path or not legacy_path.exists():
             continue
         key_bytes = legacy_path.read_bytes().strip()
         if key_bytes:
-            _write_key_file(default_key_path, key_bytes)
+            _write_key_file(runtime_default_key_path, key_bytes)
             return key_bytes
 
     generated_key = Fernet.generate_key()
-    _write_key_file(default_key_path, generated_key)
+    _write_key_file(runtime_default_key_path, generated_key)
     return generated_key
 
 

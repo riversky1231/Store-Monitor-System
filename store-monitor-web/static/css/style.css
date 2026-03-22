@@ -681,6 +681,127 @@ label {
 }
 .alert-err::before { background: var(--danger); }
 
+.network-toast {
+  position: fixed;
+  right: 22px;
+  bottom: 22px;
+  width: min(420px, calc(100vw - 24px));
+  z-index: 140;
+  opacity: 0;
+  transform: translateY(14px);
+  pointer-events: none;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.network-toast.show {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+.network-toast-card {
+  border: 1px solid #f4c48f;
+  border-radius: 18px;
+  background: linear-gradient(180deg, #fffdf8 0%, #fff7eb 100%);
+  box-shadow: 0 20px 42px rgba(118, 72, 18, 0.16);
+  padding: 16px 16px 14px 16px;
+}
+
+.network-toast.is-recovered .network-toast-card {
+  border-color: #b8e8d4;
+  background: linear-gradient(180deg, #fbfffd 0%, #eefbf5 100%);
+  box-shadow: 0 20px 42px rgba(28, 111, 79, 0.12);
+}
+
+.network-toast-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.network-toast-eyebrow {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: #b56a15;
+  margin-bottom: 4px;
+}
+
+.network-toast.is-recovered .network-toast-eyebrow {
+  color: #1b8a63;
+}
+
+.network-toast-head strong {
+  display: block;
+  font-size: 19px;
+  line-height: 1.2;
+  color: #7c4211;
+}
+
+.network-toast.is-recovered .network-toast-head strong {
+  color: #1a6a4d;
+}
+
+.network-toast-close {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 1px solid #f0d2b0;
+  background: rgba(255, 255, 255, 0.92);
+  color: #8e5a22;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.network-toast.is-recovered .network-toast-close {
+  border-color: #c8e8d9;
+  color: #246c51;
+}
+
+.network-toast-msg,
+.network-toast-detail,
+.network-toast-meta {
+  margin-top: 10px;
+}
+
+.network-toast-msg {
+  font-size: 14px;
+  line-height: 1.65;
+  color: #6f451d;
+  font-weight: 700;
+}
+
+.network-toast.is-recovered .network-toast-msg {
+  color: #245942;
+}
+
+.network-toast-detail {
+  font-size: 13px;
+  line-height: 1.7;
+  color: #8a5d2f;
+}
+
+.network-toast.is-recovered .network-toast-detail,
+.network-toast.is-recovered .network-toast-meta {
+  color: #43715d;
+}
+
+.network-toast-meta {
+  font-size: 12px;
+  color: #9b7752;
+}
+
+.network-toast-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+
 .lnk {
   color: var(--accent-deep);
   text-decoration: none;
@@ -968,6 +1089,18 @@ label {
   .modal {
     margin-top: 8px;
     border-radius: 16px;
+  }
+
+  .network-toast {
+    left: 12px;
+    right: 12px;
+    bottom: 12px;
+    width: auto;
+  }
+
+  .network-toast-card {
+    border-radius: 16px;
+    padding: 14px 14px 12px 14px;
   }
 
   .setup-box {

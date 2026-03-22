@@ -1,9 +1,7 @@
 """Routes package - shared helpers for route modules."""
-from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
-from urllib.parse import quote
 
-from utils import get_resource_path
+from utils import get_resource_path, to_beijing_time
 
 # Shared constants
 TASKS_PAGE_SIZE = 10
@@ -12,24 +10,27 @@ SQLITE_MAGIC = b"SQLite format 3\x00"
 
 # Initialize templates (shared across all route modules)
 templates = Jinja2Templates(directory=get_resource_path("templates"))
+templates.env.filters["beijing"] = to_beijing_time
 
-# Shared helper functions
-def group_error_redirect(group_id: int, message: str) -> RedirectResponse:
-    """Redirect to group page with error message."""
-    return RedirectResponse(
-        url=f"/tasks/group/{group_id}?error={quote(message)}",
-        status_code=303,
-    )
+from ._shared import _group_error_redirect as group_error_redirect
+from ._shared import _task_redirect as task_redirect
 
 
-def task_redirect(task, extra: str = "") -> RedirectResponse:
-    """Redirect to task's group page."""
-    gid = task.category_id
-    base = f"/tasks/group/{gid}" if gid else "/tasks"
-    url = f"{base}?{extra}" if extra else base
-    return RedirectResponse(url=url, status_code=303)
+def register_routes(app):
+    """Wire all route modules into the FastAPI app."""
+    from .api import router as api_router
+    from .dashboard import router as dashboard_router
+    from .groups import router as groups_router
+    from .settings import public_router, router as settings_router
+    from .tasks import router as tasks_router
+
+    app.include_router(public_router)    # /setup
+    app.include_router(dashboard_router) # /
+    app.include_router(api_router)       # /api/*
+    app.include_router(groups_router)    # /tasks, /tasks/group-create, etc.
+    app.include_router(tasks_router)     # /tasks/group/{id}, /tasks/{id}, etc.
+    app.include_router(settings_router)  # /settings
 
 
-# NOTE:
-# This module only provides shared constants, templates, and helper functions.
-# The active app wiring lives in routes/web.py.
+from .dashboard import router
+from .settings import public_router

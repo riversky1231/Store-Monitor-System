@@ -1,13 +1,10 @@
 """Task management routes."""
-import os
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
-from sqlalchemy import desc
 from sqlalchemy.orm import Session
-from urllib.parse import quote
 
 from database import get_db
-from models import Category, MonitorTask, PendingImport, ProductItem
+from models import Category, MonitorTask, PendingImport
 from scheduler import (
     EMPTY_ALERT_THRESHOLD,
     get_inflight_task_ids,
@@ -21,13 +18,14 @@ from security import (
     validate_monitor_target_url,
 )
 
-from . import TASKS_PAGE_SIZE, templates
+from . import templates
+from ._shared import _build_url, _group_error_redirect, _task_redirect
 
 router = APIRouter(dependencies=[Depends(require_admin_auth)])
 
 
 # ---------------------------------------------------------------------------
-# Group Detail (tasks list)
+# Group detail  (/tasks/group/<id>)
 # ---------------------------------------------------------------------------
 
 @router.get("/tasks/group/{group_id}", response_class=HTMLResponse)
@@ -46,9 +44,9 @@ async def group_detail(
     if search:
         q = q.filter(MonitorTask.name.ilike(f"%{search}%"))
     total = q.count()
-    total_pages = max(1, (total + TASKS_PAGE_SIZE - 1) // TASKS_PAGE_SIZE)
+    total_pages = max(1, (total + 10 - 1) // 10)
     page = min(page, total_pages)
-    tasks = q.offset((page - 1) * TASKS_PAGE_SIZE).limit(TASKS_PAGE_SIZE).all()
+    tasks = q.offset((page - 1) * 10).limit(10).all()
 
     all_groups = db.query(Category).order_by(Category.name).all()
     pending_imports = db.query(PendingImport).order_by(PendingImport.id).all()
@@ -69,15 +67,8 @@ async def group_detail(
 
 
 # ---------------------------------------------------------------------------
-# Task CRUD
+# Task CRUD  (all redirect back to the owning group)
 # ---------------------------------------------------------------------------
-
-def _task_redirect(task: MonitorTask, extra: str = "") -> RedirectResponse:
-    gid = task.category_id
-    base = f"/tasks/group/{gid}" if gid else "/tasks"
-    url = f"{base}?{extra}" if extra else base
-    return RedirectResponse(url=url, status_code=303)
-
 
 @router.post("/tasks/group/{group_id}/add")
 async def add_task(
@@ -126,7 +117,13 @@ async def add_task(
     db.commit()
     db.refresh(new_task)
     schedule_task(new_task)
-    return RedirectResponse(url=f"/tasks/group/{group_id}", status_code=303)
+
+    total_tasks = db.query(MonitorTask).filter(MonitorTask.category_id == group_id).count()
+    last_page = (total_tasks + 10 - 1) // 10
+    return RedirectResponse(
+        url=f"/tasks/group/{group_id}?page={last_page}&highlight={new_task.id}",
+        status_code=303,
+    )
 
 
 @router.post("/tasks/{task_id}/edit")
@@ -152,24 +149,21 @@ async def edit_task(
         "storefront-auto" if resolved_type == "storefront"
         else "div[data-component-type='s-search-result']"
     )
-    if gid and not task_name:
+    if not task_name:
         return _group_error_redirect(gid, "任务名称不能为空。")
-    if gid and resolved_type == "search" and not css_selector:
+    if resolved_type == "search" and not css_selector:
         return _group_error_redirect(gid, "CSS 选择器不能为空。")
     dup = db.query(MonitorTask).filter(MonitorTask.name == task_name, MonitorTask.id != task_id).first()
-    if gid and dup:
+    if dup:
         return _group_error_redirect(gid, f"店铺名称「{task_name}」已存在，请使用不同的名称。")
     if check_interval_hours < 1 or check_interval_hours > 168:
-        if gid:
-            return _group_error_redirect(gid, "检查频率必须在 1-168 小时之间。")
+        return _group_error_redirect(gid, "检查频率必须在 1-168 小时之间。")
 
     try:
         target_url = validate_monitor_target_url(url)
         recipients_value = normalize_recipients(recipients)
     except ValueError as exc:
-        if gid:
-            return _group_error_redirect(gid, str(exc))
-        return RedirectResponse(url="/tasks", status_code=303)
+        return _group_error_redirect(gid, str(exc))
 
     config_changed = task.url != target_url or task.selector != css_selector or task.task_type != resolved_type
     task.name = task_name
@@ -218,10 +212,6 @@ async def delete_task(task_id: int, db: Session = Depends(get_db)):
     return RedirectResponse(url="/tasks", status_code=303)
 
 
-# ---------------------------------------------------------------------------
-# Batch Operations
-# ---------------------------------------------------------------------------
-
 @router.post("/tasks/batch-move")
 async def batch_move_tasks(
     request: Request,
@@ -249,7 +239,11 @@ async def batch_move_tasks(
 
     db.commit()
     return RedirectResponse(
-        url=f"/tasks/group/{source_group_id}?batch_moved={moved}&target_name={quote(target_group.name)}",
+        url=_build_url(
+            f"/tasks/group/{source_group_id}",
+            batch_moved=moved,
+            target_name=target_group.name,
+        ),
         status_code=303,
     )
 
@@ -277,40 +271,47 @@ async def batch_delete_tasks(
 
     db.commit()
     return RedirectResponse(
-        url=f"/tasks/group/{source_group_id}?batch_deleted={deleted}",
+        url=_build_url(f"/tasks/group/{source_group_id}", batch_deleted=deleted),
         status_code=303,
     )
 
 
-# ---------------------------------------------------------------------------
-# Run Task / Reset Health
-# ---------------------------------------------------------------------------
+@router.post("/tasks/batch-update-interval")
+async def batch_update_interval(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    form = await request.form()
+    task_ids_raw = form.getlist("task_ids")
+    source_group_id = int(form.get("source_group_id", 0))
+    new_interval = int(form.get("new_interval", 24))
 
-@router.post("/tasks/{task_id}/run")
-async def run_task_now(task_id: int, db: Session = Depends(get_db)):
-    task = db.query(MonitorTask).filter(MonitorTask.id == task_id).first()
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found.")
+    if new_interval < 1 or new_interval > 168:
+        return _group_error_redirect(source_group_id, "检查频率必须在 1-168 小时之间。")
 
-    queued = queue_monitor_task(task_id)
-    extra = "run_started=1" if queued else "already_running=1"
-    return _task_redirect(task, extra)
+    updated = 0
+    for raw_id in task_ids_raw:
+        try:
+            tid = int(raw_id)
+        except (ValueError, TypeError):
+            continue
+        task = db.query(MonitorTask).filter(MonitorTask.id == tid).first()
+        if task:
+            task.check_interval_hours = new_interval
+            remove_scheduled_task(task.id)
+            schedule_task(task)
+            updated += 1
 
+    db.commit()
+    return RedirectResponse(
+        url=_build_url(
+            f"/tasks/group/{source_group_id}",
+            batch_updated=updated,
+            new_interval=new_interval,
+        ),
+        status_code=303,
+    )
 
-@router.post("/tasks/{task_id}/reset-health")
-async def reset_task_health(task_id: int, db: Session = Depends(get_db)):
-    """Reset consecutive empty count and health state to healthy."""
-    task = db.query(MonitorTask).filter(MonitorTask.id == task_id).first()
-    if task:
-        task.consecutive_empty_count = 0
-        task.health_state = "healthy"
-        db.commit()
-    return RedirectResponse(url="/", status_code=303)
-
-
-# ---------------------------------------------------------------------------
-# Pending Import Claims (moved from imports to tasks)
-# ---------------------------------------------------------------------------
 
 @router.post("/tasks/group/{group_id}/claim-pending")
 async def claim_pending_imports(
@@ -318,10 +319,12 @@ async def claim_pending_imports(
     request: Request,
     db: Session = Depends(get_db),
 ):
-    """Move selected pending imports into a group as real monitor tasks."""
     group = db.query(Category).filter(Category.id == group_id).first()
     if not group:
-        return RedirectResponse(url="/tasks?error=" + quote("分组不存在。"), status_code=303)
+        return RedirectResponse(
+            url=_build_url("/tasks", error="分组不存在。"),
+            status_code=303,
+        )
 
     form = await request.form()
     pending_ids_raw = form.getlist("pending_ids")
@@ -359,7 +362,6 @@ async def claim_pending_imports(
 
     db.commit()
 
-    # Schedule newly created tasks.
     new_tasks = (
         db.query(MonitorTask)
         .filter(MonitorTask.category_id == group_id)
@@ -371,22 +373,34 @@ async def claim_pending_imports(
         schedule_task(t)
 
     return RedirectResponse(
-        url=f"/tasks/group/{group_id}?claimed={claimed}",
+        url=_build_url(f"/tasks/group/{group_id}", claimed=claimed),
         status_code=303,
     )
 
 
 @router.post("/tasks/clear-pending")
 async def clear_pending_imports(db: Session = Depends(get_db)):
-    """Delete all pending imports."""
     db.query(PendingImport).delete()
     db.commit()
-    return RedirectResponse(url="/tasks?pending_cleared=1", status_code=303)
+    return RedirectResponse(url=_build_url("/tasks", pending_cleared=1), status_code=303)
 
 
-# Import helper from parent
-def _group_error_redirect(group_id: int, message: str) -> RedirectResponse:
-    return RedirectResponse(
-        url=f"/tasks/group/{group_id}?error={quote(message)}",
-        status_code=303,
-    )
+@router.post("/tasks/{task_id}/run")
+async def run_task_now(task_id: int, db: Session = Depends(get_db)):
+    task = db.query(MonitorTask).filter(MonitorTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+
+    queued = queue_monitor_task(task_id)
+    extra = "run_started=1" if queued else "already_running=1"
+    return _task_redirect(task, extra)
+
+
+@router.post("/tasks/{task_id}/reset-health")
+async def reset_task_health(task_id: int, db: Session = Depends(get_db)):
+    task = db.query(MonitorTask).filter(MonitorTask.id == task_id).first()
+    if task:
+        task.consecutive_empty_count = 0
+        task.health_state = "healthy"
+        db.commit()
+    return RedirectResponse(url="/", status_code=303)

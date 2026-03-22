@@ -58,8 +58,8 @@ if errorlevel 1 (
     powershell -Command "(gc AmazonStoreMonitor.onedir.spec) -replace 'icon.ico','icon.png' | Out-File -encoding utf8 AmazonStoreMonitor.onedir.spec"
 )
 
-rem 5. Choose build mode (fixed to onedir)
-echo [5/6] Build mode: Onedir (faster startup, smaller EXE)
+rem 5. Choose build mode (fixed to onedir for faster startup)
+echo [5/6] Build mode: Onedir (faster startup, larger output folder)
 set "BUILD_SPEC=AmazonStoreMonitor.onedir.spec"
 
 rem 6. Run PyInstaller

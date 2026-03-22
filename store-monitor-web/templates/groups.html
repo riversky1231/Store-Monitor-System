@@ -42,13 +42,13 @@
 {% block content %}
 
 {% if request.query_params.get('run_all') %}
-<div class="alert alert-ok">已将 {{ request.query_params.get('queued') }} 个任务加入执行队列，全部完成后将发送一封综合报告邮件。</div>
+<div class="alert alert-ok">已将 {{ request.query_params.get('queued') | e }} 个任务加入执行队列，全部完成后将发送一封综合报告邮件。</div>
 {% endif %}
 {% if request.query_params.get('queue_stopped') %}
 <div class="alert alert-info">
-  已强制停止运行队列，清空 {{ request.query_params.get('cleared') }} 个等待任务。
+  已强制停止运行队列，清空 {{ request.query_params.get('cleared') | e }} 个等待任务。
   {% if request.query_params.get('running') %}
-  已尝试中断正在执行的任务（ID={{ request.query_params.get('running') }}）。
+  已尝试中断正在执行的任务（ID={{ request.query_params.get('running') | e }}）。
   {% endif %}
 </div>
 {% endif %}
@@ -56,15 +56,15 @@
 <div class="alert alert-ok">
   导入完成：
   {% if request.query_params.get('groups') and request.query_params.get('groups') != '0' %}
-  创建了 <strong>{{ request.query_params.get('groups') }}</strong> 个分组，
+  创建了 <strong>{{ request.query_params.get('groups') | e }}</strong> 个分组，
   {% endif %}
-  成功导入 <strong>{{ request.query_params.get('imported') }}</strong> 个店铺，跳过 {{ request.query_params.get('skipped') }} 个。
+  成功导入 <strong>{{ request.query_params.get('imported') | e }}</strong> 个店铺，跳过 {{ request.query_params.get('skipped') | e }} 个。
   点击「全部执行」即可开始监控。
 </div>
 {% endif %}
 {% if request.query_params.get('pending_ok') %}
 <div class="alert alert-ok">
-  已从旧版数据库中读取 <strong>{{ request.query_params.get('pending') }}</strong> 个店铺到待分配列表，跳过 {{ request.query_params.get('skipped') }} 个。
+  已从旧版数据库中读取 <strong>{{ request.query_params.get('pending') | e }}</strong> 个店铺到待分配列表，跳过 {{ request.query_params.get('skipped') | e }} 个。
   请进入各分组，从待分配列表中勾选店铺进行分配。
 </div>
 {% endif %}
@@ -72,7 +72,7 @@
 <div class="alert alert-ok">已清空待分配列表。</div>
 {% endif %}
 {% if request.query_params.get('error') %}
-<div class="alert alert-err">{{ request.query_params.get('error') }}</div>
+<div class="alert alert-err">{{ request.query_params.get('error') | e }}</div>
 {% endif %}
 
 {% if pending_count > 0 %}

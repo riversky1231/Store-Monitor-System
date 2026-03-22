@@ -62,6 +62,24 @@
   </div>
 
 </div>
+<div id="networkIssueToast" class="network-toast" hidden aria-live="polite" aria-atomic="true">
+  <div class="network-toast-card">
+    <div class="network-toast-head">
+      <div>
+        <div class="network-toast-eyebrow">系统提醒</div>
+        <strong id="networkIssueToastTitle">抓取网络异常提醒</strong>
+      </div>
+      <button type="button" class="network-toast-close" id="networkIssueToastClose" aria-label="关闭提醒">×</button>
+    </div>
+    <p class="network-toast-msg" id="networkIssueToastMessage"></p>
+    <p class="network-toast-detail" id="networkIssueToastDetail"></p>
+    <p class="network-toast-meta" id="networkIssueToastMeta"></p>
+    <div class="network-toast-actions">
+      <a href="/tasks" class="btn btn-ghost">查看任务</a>
+      <button type="button" class="btn btn-primary" id="networkIssueToastAck">知道了</button>
+    </div>
+  </div>
+</div>
 <script src="/static/js/main.js"></script>
 </body>
 </html>

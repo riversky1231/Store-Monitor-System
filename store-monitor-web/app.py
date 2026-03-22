@@ -19,13 +19,13 @@ from contextlib import asynccontextmanager
 
 from database import run_migrations, SessionLocal
 from models import SystemConfig
-from scheduler import init_scheduler, scheduler
-from utils import get_resource_path
+from scheduler import init_scheduler, shutdown_scheduler
+from utils import get_resource_path, get_runtime_base_path
 
 # ---------------------------------------------------------------------------
 # Persistent file logging — survives crashes, aids debugging.
 # ---------------------------------------------------------------------------
-_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0] if not getattr(sys, "frozen", False) else sys.executable)), "logs")
+_LOG_DIR = os.path.join(str(get_runtime_base_path()), "logs")
 os.makedirs(_LOG_DIR, exist_ok=True)
 _LOG_FILE = os.path.join(_LOG_DIR, "monitor.log")
 
@@ -135,7 +135,7 @@ def _ensure_playwright_browser():
 
             _browser_installed = _browsers_present(browsers_dir)
     except Exception as exc:
-        logger.debug("Playwright browser ensure failed: %s", exc)
+        logger.warning("Playwright browser ensure failed: %s", exc)
 
 
 def _use_bundled_browsers() -> bool:
@@ -237,9 +237,22 @@ threading.Thread(target=_ensure_playwright_browser, daemon=True).start()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_scheduler()
-    yield
+    try:
+        yield
+    finally:
+        shutdown_scheduler(wait=False)
 
 app = FastAPI(title="Store Monitor Web App", lifespan=lifespan)
+app.state.setup_complete_cache = None
+
+
+def _load_setup_complete_flag() -> bool:
+    db = SessionLocal()
+    try:
+        row = db.query(SystemConfig.setup_complete).first()
+        return bool(row and row[0])
+    finally:
+        db.close()
 
 @app.middleware("http")
 async def setup_guard(request: Request, call_next):
@@ -250,13 +263,13 @@ async def setup_guard(request: Request, call_next):
     # If env-var password is configured, skip DB setup check (dev/server mode).
     if os.getenv("MONITOR_WEB_PASSWORD", "").strip():
         return await call_next(request)
-    db = SessionLocal()
-    try:
-        config = db.query(SystemConfig).first()
-        if not config or not config.setup_complete:
-            return RedirectResponse(url="/setup", status_code=302)
-    finally:
-        db.close()
+
+    cached = request.app.state.setup_complete_cache
+    if cached is None:
+        cached = _load_setup_complete_flag()
+        request.app.state.setup_complete_cache = cached
+    if not cached:
+        return RedirectResponse(url="/setup", status_code=302)
     return await call_next(request)
 
 # Static and Templates paths
@@ -269,23 +282,11 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 templates = Jinja2Templates(directory=templates_dir)
 
 # Add custom filter to convert UTC to Beijing time (UTC+8)
-import datetime
-def to_beijing_time(dt):
-    """Convert UTC datetime to Beijing time (UTC+8)."""
-    if dt is None:
-        return ""
-    if dt.tzinfo is None:
-        # Assume naive datetime is UTC
-        dt = dt.replace(tzinfo=datetime.timezone.utc)
-    beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
-    beijing_dt = dt.astimezone(beijing_tz)
-    return beijing_dt.strftime('%m-%d %H:%M')
-
+from utils import to_beijing_time
 templates.env.filters["beijing"] = to_beijing_time
 
-from routes.web import router as web_router, public_router
-app.include_router(public_router)
-app.include_router(web_router)
+from routes import register_routes
+register_routes(app)
 
 import webbrowser
 import tkinter as tk
@@ -300,13 +301,13 @@ class ConsoleEmulator:
         self.root = root
         self.root.title("Amazon Store Monitor - Console")
         self.root.geometry("800x500")
-        self.root.configure(bg='black')
+        self.root.configure(bg='#000000')
         
         # Don't destroy on close, just hide
         self.root.protocol("WM_DELETE_WINDOW", self.hide)
         
         self.text_area = scrolledtext.ScrolledText(
-            self.root, bg='black', fg='#00FF00', # Classic matrix green
+            self.root, bg='#000000', fg='#00FF00', # Classic matrix green
             insertbackground='white', font=('Consolas', 10),
             padx=10, pady=10
         )
@@ -355,10 +356,8 @@ def open_browser():
 def quit_app(icon, item, root):
     print("正在彻底退出程序...")
     icon.stop()
-    if scheduler.running:
-        scheduler.shutdown(wait=False)
-    root.quit()
-    os._exit(0)
+    shutdown_scheduler(wait=False)
+    root.after(0, root.quit)
 
 def start_tray(console_ui, root):
     icon_path = get_resource_path(os.path.join("static", "icon.png"))

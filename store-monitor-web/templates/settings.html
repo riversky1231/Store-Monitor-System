@@ -6,6 +6,9 @@
 {% if request.query_params.get('success') %}
 <div class="alert alert-ok">设置已保存成功。</div>
 {% endif %}
+{% if request.query_params.get('error') %}
+<div class="alert alert-err">{{ request.query_params.get('error') | e }}</div>
+{% endif %}
 
 <form action="/settings" method="post" class="settings-wrap">
 

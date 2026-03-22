@@ -19,6 +19,7 @@ from security import (
     SMTP_SECRET_FILE_ENV,
     SMTP_SECRET_KEY_ENV,
     AUTH_USERNAME_ENV,
+    is_valid_email,
     normalize_recipients,
     require_admin_auth,
     validate_monitor_target_url,
@@ -97,7 +98,7 @@ class SecurityTests(unittest.TestCase):
             require_admin_auth(request=request, credentials=wrong_credentials)
         self.assertEqual(ctx.exception.status_code, 429)
 
-    def test_secret_key_file_defaults_to_working_directory(self):
+    def test_secret_key_file_defaults_to_runtime_directory(self):
         os.environ.pop(SMTP_SECRET_KEY_ENV, None)
         os.environ.pop(SMTP_SECRET_FILE_ENV, None)
         security._fernet_client = None
@@ -106,13 +107,14 @@ class SecurityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             os.chdir(tmpdir)
             try:
-                key1 = security._load_or_create_secret_key()
-                expected_path = Path(tmpdir) / SMTP_SECRET_FILE_DEFAULT
-                self.assertTrue(expected_path.exists())
-                self.assertEqual(expected_path.read_bytes().strip(), key1)
+                with patch("security.get_runtime_base_path", return_value=Path(tmpdir)):
+                    key1 = security._load_or_create_secret_key()
+                    expected_path = Path(tmpdir) / SMTP_SECRET_FILE_DEFAULT
+                    self.assertTrue(expected_path.exists())
+                    self.assertEqual(expected_path.read_bytes().strip(), key1)
 
-                key2 = security._load_or_create_secret_key()
-                self.assertEqual(key1, key2)
+                    key2 = security._load_or_create_secret_key()
+                    self.assertEqual(key1, key2)
             finally:
                 os.chdir(old_cwd)
 
@@ -195,6 +197,43 @@ class ValidateMonitorTargetUrlTests(unittest.TestCase):
     def test_empty_url_rejected(self):
         with self.assertRaises(ValueError):
             validate_monitor_target_url("")
+
+
+class IsValidEmailTests(unittest.TestCase):
+    """测试 is_valid_email() 函数的邮件地址格式验证。"""
+
+    def test_standard_email_accepted(self):
+        self.assertTrue(is_valid_email("user@example.com"))
+
+    def test_subdomain_email_accepted(self):
+        self.assertTrue(is_valid_email("user@mail.example.co.uk"))
+
+    def test_plus_tag_email_accepted(self):
+        self.assertTrue(is_valid_email("user+tag@example.com"))
+
+    def test_missing_at_sign_rejected(self):
+        self.assertFalse(is_valid_email("userexample.com"))
+
+    def test_missing_domain_rejected(self):
+        self.assertFalse(is_valid_email("user@"))
+
+    def test_missing_local_part_rejected(self):
+        self.assertFalse(is_valid_email("@example.com"))
+
+    def test_empty_string_rejected(self):
+        self.assertFalse(is_valid_email(""))
+
+    def test_no_tld_rejected(self):
+        self.assertFalse(is_valid_email("user@localhost"))
+
+    def test_control_char_rejected(self):
+        self.assertFalse(is_valid_email("user\r@example.com"))
+
+    def test_is_valid_email_falls_back_to_regex_when_library_unavailable(self):
+        """当 email-validator 不可用时，应回退到正则验证。"""
+        with patch.object(security, "_EMAIL_VALIDATOR_AVAILABLE", False):
+            self.assertTrue(is_valid_email("fallback@example.com"))
+            self.assertFalse(is_valid_email("bad-email"))
 
 
 if __name__ == "__main__":
