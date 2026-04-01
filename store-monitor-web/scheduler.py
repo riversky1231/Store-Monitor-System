@@ -56,6 +56,8 @@ _execution_queue: queue.Queue[int | None] = queue.Queue()
 _worker_thread: threading.Thread | None = None
 _scheduler_init_lock = threading.Lock()
 _scheduler_shutdown_lock = threading.Lock()
+_digest_flush_lock = threading.Lock()
+_digest_flush_timer: threading.Timer | None = None
 
 _force_stop_lock = threading.Lock()
 
@@ -81,6 +83,9 @@ _TASK_RETRY_DELAY = (10, 20)   # Random delay (seconds) between retries.
 _INTER_TASK_DELAY = (3, 8)     # Random delay (seconds) between consecutive tasks.
 _SCRAPE_TIMEOUT = 600          # Max seconds for a single scrape attempt.
 _SMTP_RETRY_ATTEMPTS = 2      # Extra retries for email sending.
+_DIGEST_FLUSH_DELAY_SECONDS = max(
+    5, int(os.getenv("MONITOR_WEB_DIGEST_FLUSH_DELAY_SECONDS", "60") or "60")
+)
 _NETWORK_CHECK_INTERVAL_MINUTES = 30  # Check network every 30 minutes when tasks are pending retry
 _NETWORK_ALERT_POPUP_COOLDOWN_SECONDS = max(
     60, int(os.getenv("MONITOR_WEB_NETWORK_ALERT_COOLDOWN_SECONDS", "900") or "900")
@@ -341,6 +346,7 @@ def execute_monitor_task(task_id: int):
     if not _acquire_task_slot(task_id):
         logger.warning("Task %s is already queued or running, skipping interval trigger.", task_id)
         return
+    _cancel_scheduled_digest_flush()
     with _task_state_lock:
         _queued_task_ids.append(task_id)
     _execution_queue.put(task_id)
@@ -512,6 +518,50 @@ def _send_consolidated_email(db, entries: list[dict]) -> None:
     )
 
 
+def _run_scheduled_digest_flush(timer: threading.Timer) -> None:
+    global _digest_flush_timer
+    with _digest_flush_lock:
+        if _digest_flush_timer is not timer:
+            return
+        _digest_flush_timer = None
+    logger.info("Digest flush timer fired after %.1fs of queue inactivity.", timer.interval)
+    _flush_digest()
+
+
+def _cancel_scheduled_digest_flush() -> None:
+    global _digest_flush_timer
+    with _digest_flush_lock:
+        timer = _digest_flush_timer
+        _digest_flush_timer = None
+
+    if timer is not None:
+        timer.cancel()
+        logger.debug("Cancelled pending digest flush.")
+
+
+def _schedule_digest_flush(delay_seconds: float | None = None) -> None:
+    global _digest_flush_timer
+
+    delay = _DIGEST_FLUSH_DELAY_SECONDS if delay_seconds is None else max(0.0, float(delay_seconds))
+    _cancel_scheduled_digest_flush()
+
+    timer: threading.Timer | None = None
+
+    def _flush_when_idle() -> None:
+        if timer is not None:
+            _run_scheduled_digest_flush(timer)
+
+    timer = threading.Timer(delay, _flush_when_idle)
+    timer.daemon = True
+    timer.name = "digest-flush-timer"
+
+    with _digest_flush_lock:
+        _digest_flush_timer = timer
+
+    timer.start()
+    logger.info("Scheduled digest flush in %.1fs.", delay)
+
+
 def queue_monitor_task(task_id: int) -> bool:
     """Enqueue a task for serial execution (manual trigger or initial run after add/import).
 
@@ -520,6 +570,7 @@ def queue_monitor_task(task_id: int) -> bool:
     if not _acquire_task_slot(task_id):
         logger.warning("Task %s is already queued or running, skipping.", task_id)
         return False
+    _cancel_scheduled_digest_flush()
     with _task_state_lock:
         _queued_task_ids.append(task_id)
     _execution_queue.put(task_id)
@@ -587,6 +638,7 @@ def _queue_worker() -> None:
     while True:
         task_id = _execution_queue.get()
         if task_id is None:          # shutdown sentinel
+            _cancel_scheduled_digest_flush()
             _flush_digest()
             _execution_queue.task_done()
             logger.info("Serial task-execution worker stopping.")
@@ -608,9 +660,10 @@ def _queue_worker() -> None:
             # Reschedule: next run = now + interval (dynamic timing).
             _reschedule_after_run(task_id)
 
-        # If no more tasks are queued, flush the accumulated digest now.
+        # When the queue falls idle, wait briefly before flushing so closely
+        # spaced task triggers are still merged into one consolidated report.
         if _execution_queue.empty():
-            _flush_digest()
+            _schedule_digest_flush()
         else:
             # Throttle between consecutive tasks to avoid anti-bot detection.
             delay = random.uniform(*_INTER_TASK_DELAY)

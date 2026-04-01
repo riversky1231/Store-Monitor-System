@@ -107,7 +107,7 @@ class SecurityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             os.chdir(tmpdir)
             try:
-                with patch("security.get_runtime_base_path", return_value=Path(tmpdir)):
+                with patch("security.get_runtime_data_path", return_value=Path(tmpdir)):
                     key1 = security._load_or_create_secret_key()
                     expected_path = Path(tmpdir) / SMTP_SECRET_FILE_DEFAULT
                     self.assertTrue(expected_path.exists())

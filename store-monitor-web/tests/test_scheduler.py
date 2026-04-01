@@ -1,4 +1,5 @@
 import datetime
+import queue
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,118 @@ from models import MonitorTask, ProductItem, SystemConfig
 
 
 class SchedulerTests(unittest.TestCase):
+    def test_schedule_digest_flush_replaces_existing_timer_and_flushes_once(self):
+        class FakeTimer:
+            instances = []
+
+            def __init__(self, interval, function, args=None, kwargs=None):
+                self.interval = interval
+                self.function = function
+                self.args = args or ()
+                self.kwargs = kwargs or {}
+                self.started = False
+                self.cancelled = False
+                self.daemon = False
+                self.name = None
+                FakeTimer.instances.append(self)
+
+            def start(self):
+                self.started = True
+
+            def cancel(self):
+                self.cancelled = True
+
+        original_timer = scheduler._digest_flush_timer
+        try:
+            FakeTimer.instances = []
+            scheduler._digest_flush_timer = None
+
+            with patch("scheduler.threading.Timer", FakeTimer), \
+                 patch("scheduler._flush_digest") as flush_mock:
+                scheduler._schedule_digest_flush(delay_seconds=12)
+                first_timer = FakeTimer.instances[-1]
+                self.assertTrue(first_timer.started)
+                self.assertEqual(first_timer.interval, 12)
+                self.assertTrue(first_timer.daemon)
+                self.assertEqual(first_timer.name, "digest-flush-timer")
+
+                scheduler._schedule_digest_flush(delay_seconds=6)
+                second_timer = FakeTimer.instances[-1]
+                self.assertTrue(first_timer.cancelled)
+                self.assertTrue(second_timer.started)
+                self.assertEqual(second_timer.interval, 6)
+
+                second_timer.function(*second_timer.args, **second_timer.kwargs)
+                self.assertIsNone(scheduler._digest_flush_timer)
+                flush_mock.assert_called_once()
+        finally:
+            scheduler._digest_flush_timer = original_timer
+
+    def test_queue_monitor_task_cancels_pending_digest_flush(self):
+        class PendingTimer:
+            def __init__(self):
+                self.cancelled = False
+
+            def cancel(self):
+                self.cancelled = True
+
+        original_timer = scheduler._digest_flush_timer
+        original_queue = scheduler._execution_queue
+        original_inflight = scheduler._inflight_task_ids
+        original_queued = scheduler._queued_task_ids
+
+        try:
+            pending_timer = PendingTimer()
+            scheduler._digest_flush_timer = pending_timer
+            scheduler._execution_queue = queue.Queue()
+            scheduler._inflight_task_ids = set()
+            scheduler._queued_task_ids = []
+
+            queued = scheduler.queue_monitor_task(42)
+
+            self.assertTrue(queued)
+            self.assertTrue(pending_timer.cancelled)
+            self.assertIsNone(scheduler._digest_flush_timer)
+            self.assertEqual(scheduler._queued_task_ids, [42])
+            self.assertEqual(scheduler._execution_queue.get_nowait(), 42)
+        finally:
+            scheduler._digest_flush_timer = original_timer
+            scheduler._execution_queue = original_queue
+            scheduler._inflight_task_ids = original_inflight
+            scheduler._queued_task_ids = original_queued
+
+    def test_execute_monitor_task_cancels_pending_digest_flush(self):
+        class PendingTimer:
+            def __init__(self):
+                self.cancelled = False
+
+            def cancel(self):
+                self.cancelled = True
+
+        original_timer = scheduler._digest_flush_timer
+        original_queue = scheduler._execution_queue
+        original_inflight = scheduler._inflight_task_ids
+        original_queued = scheduler._queued_task_ids
+
+        try:
+            pending_timer = PendingTimer()
+            scheduler._digest_flush_timer = pending_timer
+            scheduler._execution_queue = queue.Queue()
+            scheduler._inflight_task_ids = set()
+            scheduler._queued_task_ids = []
+
+            scheduler.execute_monitor_task(84)
+
+            self.assertTrue(pending_timer.cancelled)
+            self.assertIsNone(scheduler._digest_flush_timer)
+            self.assertEqual(scheduler._queued_task_ids, [84])
+            self.assertEqual(scheduler._execution_queue.get_nowait(), 84)
+        finally:
+            scheduler._digest_flush_timer = original_timer
+            scheduler._execution_queue = original_queue
+            scheduler._inflight_task_ids = original_inflight
+            scheduler._queued_task_ids = original_queued
+
     def test_parse_recipients_filters_invalid_and_deduplicates(self):
         raw = "a@test.com,invalid-email,a@test.com,b@test.com,\r\nbad@test.com"
         actual = scheduler._parse_recipients(raw)

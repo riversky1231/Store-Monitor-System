@@ -58,9 +58,14 @@ if errorlevel 1 (
     powershell -Command "(gc AmazonStoreMonitor.onedir.spec) -replace 'icon.ico','icon.png' | Out-File -encoding utf8 AmazonStoreMonitor.onedir.spec"
 )
 
-rem 5. Choose build mode (fixed to onedir for faster startup)
-echo [5/6] Build mode: Onedir (faster startup, larger output folder)
-set "BUILD_SPEC=AmazonStoreMonitor.onedir.spec"
+rem 5. Choose build mode
+if /I "%~1"=="onedir" (
+    echo [5/6] Build mode: Onedir (no temp extraction warning; distribute whole folder)
+    set "BUILD_SPEC=AmazonStoreMonitor.onedir.spec"
+) else (
+    echo [5/6] Build mode: Onefile (single exe for clients with no Python environment)
+    set "BUILD_SPEC=AmazonStoreMonitor.spec"
+)
 
 rem 6. Run PyInstaller
 echo [6/6] Building (may take 3-10 minutes)...
@@ -94,6 +99,10 @@ echo   Output:
 echo     Onefile: dist\AmazonStoreMonitor.exe
 echo     Onedir:  dist\AmazonStoreMonitor\AmazonStoreMonitor.exe
 echo =========================================
+echo.
+echo Notes:
+echo   - Database/key/logs are now stored in %%APPDATA%%\AmazonStoreMonitor (persistent across reboot).
+echo   - If you see "_MEI temporary directory" warning in onefile mode, rebuild with: build.bat onedir
 echo.
 echo First run note:
 echo   Chromium is bundled for offline use.

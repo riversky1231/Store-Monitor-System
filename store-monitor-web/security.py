@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from utils import get_runtime_base_path
+from utils import get_runtime_data_path
 
 try:
     from cryptography.fernet import Fernet, InvalidToken
@@ -470,7 +470,7 @@ def _load_or_create_secret_key() -> bytes:
     if configured_key_path:
         return _read_or_create_key_at(Path(configured_key_path))
 
-    runtime_default_key_path = get_runtime_base_path() / SMTP_SECRET_FILE_DEFAULT
+    runtime_default_key_path = get_runtime_data_path() / SMTP_SECRET_FILE_DEFAULT
     if runtime_default_key_path.exists():
         return runtime_default_key_path.read_bytes().strip()
 

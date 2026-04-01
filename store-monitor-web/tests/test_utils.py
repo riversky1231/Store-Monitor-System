@@ -1,7 +1,7 @@
 import os
 import unittest
 
-from utils import get_resource_path, get_runtime_base_path, response_looks_blocked
+from utils import get_resource_path, get_runtime_base_path, get_runtime_data_path, response_looks_blocked
 
 
 class GetResourcePathTests(unittest.TestCase):
@@ -12,6 +12,9 @@ class GetResourcePathTests(unittest.TestCase):
 
     def test_runtime_base_path_is_absolute(self):
         self.assertTrue(get_runtime_base_path().is_absolute())
+
+    def test_runtime_data_path_is_absolute(self):
+        self.assertTrue(get_runtime_data_path().is_absolute())
 
     def test_traversal_rejected(self):
         with self.assertRaises(ValueError):

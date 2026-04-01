@@ -1,11 +1,12 @@
 import os
 import logging
+import shutil
 from pathlib import Path
 
 from sqlalchemy import create_engine, text, DDL
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-from utils import get_runtime_base_path
+from utils import get_runtime_base_path, get_runtime_data_path
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +22,36 @@ def _resolve_database_path() -> Path:
 
     cwd_path = (Path.cwd() / "monitor.db").resolve()
     runtime_path = (get_runtime_base_path() / "monitor.db").resolve()
-    if cwd_path.exists():
-        return cwd_path
-    if runtime_path.exists():
-        return runtime_path
-    runtime_path.parent.mkdir(parents=True, exist_ok=True)
-    return runtime_path
+    data_path = (get_runtime_data_path() / "monitor.db").resolve()
+
+    if data_path.exists():
+        return data_path
+
+    legacy_candidates: list[Path] = []
+    if cwd_path != data_path:
+        legacy_candidates.append(cwd_path)
+    if runtime_path != data_path and runtime_path != cwd_path:
+        legacy_candidates.append(runtime_path)
+
+    for legacy_path in legacy_candidates:
+        if not legacy_path.exists():
+            continue
+        try:
+            data_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(legacy_path, data_path)
+            logger.info("Migrated database from %s to %s", legacy_path, data_path)
+            return data_path
+        except Exception as exc:
+            logger.warning(
+                "Failed to migrate database from %s to %s: %s",
+                legacy_path,
+                data_path,
+                exc,
+            )
+            return legacy_path
+
+    data_path.parent.mkdir(parents=True, exist_ok=True)
+    return data_path
 
 
 DB_PATH = _resolve_database_path()

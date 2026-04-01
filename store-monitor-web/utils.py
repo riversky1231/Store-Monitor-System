@@ -1,4 +1,5 @@
 import datetime
+import os
 import re
 import socket
 import sys
@@ -24,6 +25,30 @@ def get_runtime_base_path() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+
+def get_runtime_data_path() -> Path:
+    """Return a persistent writable data directory for runtime files."""
+    configured = (os.getenv("MONITOR_WEB_DATA_DIR") or "").strip()
+    if configured:
+        configured_path = Path(configured).expanduser()
+        if not configured_path.is_absolute():
+            configured_path = (get_runtime_base_path() / configured_path).resolve()
+        configured_path.mkdir(parents=True, exist_ok=True)
+        return configured_path
+
+    if not getattr(sys, "frozen", False):
+        runtime_path = get_runtime_base_path()
+        runtime_path.mkdir(parents=True, exist_ok=True)
+        return runtime_path
+
+    appdata = (os.getenv("APPDATA") or os.getenv("LOCALAPPDATA") or "").strip()
+    if appdata:
+        data_path = Path(appdata) / "AmazonStoreMonitor"
+    else:
+        data_path = Path.home() / ".amazon-store-monitor"
+    data_path.mkdir(parents=True, exist_ok=True)
+    return data_path
 
 
 def _normalized_relative_path(relative_path: str) -> Path:

@@ -20,12 +20,12 @@ from contextlib import asynccontextmanager
 from database import run_migrations, SessionLocal
 from models import SystemConfig
 from scheduler import init_scheduler, shutdown_scheduler
-from utils import get_resource_path, get_runtime_base_path
+from utils import get_resource_path, get_runtime_data_path
 
 # ---------------------------------------------------------------------------
 # Persistent file logging — survives crashes, aids debugging.
 # ---------------------------------------------------------------------------
-_LOG_DIR = os.path.join(str(get_runtime_base_path()), "logs")
+_LOG_DIR = os.path.join(str(get_runtime_data_path()), "logs")
 os.makedirs(_LOG_DIR, exist_ok=True)
 _LOG_FILE = os.path.join(_LOG_DIR, "monitor.log")
 

@@ -27,7 +27,7 @@ from urllib.parse import (
 from sqlalchemy.orm import Session
 
 from models import MonitorTask, ProductItem
-from utils import get_runtime_base_path
+from utils import get_runtime_data_path
 
 if TYPE_CHECKING:  # only for type checkers; not imported at runtime
     from playwright.sync_api import Locator, Page
@@ -123,6 +123,7 @@ _OVERLAY_DISMISS_SELECTORS = (
     "button:has-text('Accept Cookies')",
     "button:has-text('Accept')",
 )
+_LD_LIBRARY_PATH_SEP = ":"
 
 
 class ScrapeCancelled(Exception):
@@ -136,7 +137,7 @@ class ScrapeTransientError(Exception):
 
 
 def _runtime_base_dir() -> Path:
-    return get_runtime_base_path()
+    return get_runtime_data_path()
 
 
 def _state_dir() -> Path:
@@ -408,11 +409,26 @@ def _launch_browser(playwright):
         return playwright.chromium.launch(**launch_kwargs)
 
 
+def _split_ld_library_path(raw_value: str | None) -> List[str]:
+    value = (raw_value or "").strip()
+    if not value:
+        return []
+    if ";" in value:
+        return [item.strip() for item in value.split(";") if item.strip()]
+    if os.name == "nt" and re.search(r"[A-Za-z]:[\\/]", value):
+        return [
+            item.strip()
+            for item in re.split(r":(?=(?:[A-Za-z]:[\\/]|/))", value)
+            if item.strip()
+        ]
+    return [item.strip() for item in value.split(_LD_LIBRARY_PATH_SEP) if item.strip()]
+
+
 def _playwright_library_dirs() -> List[str]:
     candidates: List[Path] = []
     override = (os.getenv("MONITOR_WEB_PLAYWRIGHT_LD_LIBRARY_PATH") or "").strip()
     if override:
-        for item in override.split(os.pathsep):
+        for item in _split_ld_library_path(override):
             if item.strip():
                 candidates.append(Path(item.strip()).expanduser())
 
@@ -444,12 +460,12 @@ def _playwright_launch_env() -> Dict[str, str] | None:
         return None
 
     env = dict(os.environ)
-    existing = [item for item in env.get("LD_LIBRARY_PATH", "").split(os.pathsep) if item]
+    existing = _split_ld_library_path(env.get("LD_LIBRARY_PATH", ""))
     merged: List[str] = []
     for item in library_dirs + existing:
         if item not in merged:
             merged.append(item)
-    env["LD_LIBRARY_PATH"] = os.pathsep.join(merged)
+    env["LD_LIBRARY_PATH"] = _LD_LIBRARY_PATH_SEP.join(merged)
     return env
 
 

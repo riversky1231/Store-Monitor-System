@@ -81,10 +81,13 @@ python app.py
 
 ## 数据文件
 
-默认在运行目录（通常是 `dist`）：
+默认持久化目录（Windows）：`%APPDATA%\AmazonStoreMonitor`
 
 - `monitor.db`：SQLite 主数据库
 - `.store_monitor_secret.key`：SMTP 密码加密密钥（请妥善备份）
+- `logs\monitor.log`：运行日志
+
+可通过环境变量 `MONITOR_WEB_DATA_DIR` 自定义目录。
 
 ## 环境变量
 
@@ -118,12 +121,13 @@ pytest -q tests/
 
 ```powershell
 cd store-monitor-web
-python -m PyInstaller --noconfirm --clean AmazonStoreMonitor.spec
+build.bat
 ```
 
 输出：
 
 - `dist\AmazonStoreMonitor.exe`
+- （可选）`build.bat onedir` 输出 `dist\AmazonStoreMonitor\AmazonStoreMonitor.exe`
 
 ## 故障排查
 
