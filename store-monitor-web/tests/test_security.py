@@ -1,5 +1,6 @@
 import os
 import socket
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,13 +16,17 @@ from security import (
     AUTH_RATE_LIMIT_MAX_ATTEMPTS_ENV,
     AUTH_RATE_LIMIT_WINDOW_SECONDS_ENV,
     AUTH_REQUIRE_HTTPS_ENV,
+    ALLOW_PRIVATE_PROXY_ENV,
     SMTP_SECRET_FILE_DEFAULT,
     SMTP_SECRET_FILE_ENV,
     SMTP_SECRET_KEY_ENV,
     AUTH_USERNAME_ENV,
     is_valid_email,
+    is_trusted_write_request,
     normalize_recipients,
     require_admin_auth,
+    security_response_headers,
+    validate_proxy_url,
     validate_monitor_target_url,
 )
 
@@ -31,17 +36,27 @@ _LOOPBACK_DNS = [(None, None, None, None, ("127.0.0.1", 0))]
 _COMPAT_PROXY_DNS = [(None, None, None, None, ("198.18.0.4", 0))]
 
 
-def _build_request(host: str, scheme: str = "http", client_ip: str = "198.51.100.7") -> Request:
+def _build_request(
+    host: str,
+    scheme: str = "http",
+    client_ip: str = "198.51.100.7",
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+) -> Request:
+    encoded_headers = [
+        (name.lower().encode("latin-1"), value.encode("latin-1"))
+        for name, value in (headers or {}).items()
+    ]
     scope = {
         "type": "http",
         "http_version": "1.1",
-        "method": "GET",
+        "method": method,
         "scheme": scheme,
         "path": "/",
         "raw_path": b"/",
         "root_path": "",
         "query_string": b"",
-        "headers": [],
+        "headers": encoded_headers,
         "client": (client_ip, 12345),
         "server": (host, 80 if scheme == "http" else 443),
     }
@@ -98,6 +113,75 @@ class SecurityTests(unittest.TestCase):
             require_admin_auth(request=request, credentials=wrong_credentials)
         self.assertEqual(ctx.exception.status_code, 429)
 
+    def test_cross_site_browser_write_is_rejected(self):
+        request = _build_request(
+            host="127.0.0.1",
+            method="POST",
+            headers={
+                "host": "127.0.0.1",
+                "origin": "https://evil.example",
+                "sec-fetch-site": "cross-site",
+            },
+        )
+        self.assertFalse(is_trusted_write_request(request))
+
+    def test_same_origin_browser_write_is_allowed(self):
+        request = _build_request(
+            host="127.0.0.1",
+            method="POST",
+            headers={
+                "host": "127.0.0.1",
+                "origin": "http://127.0.0.1",
+                "sec-fetch-site": "same-origin",
+            },
+        )
+        self.assertTrue(is_trusted_write_request(request))
+
+    def test_same_origin_browser_write_with_null_origin_is_allowed(self):
+        request = _build_request(
+            host="127.0.0.1",
+            method="POST",
+            headers={
+                "host": "127.0.0.1:8000",
+                "origin": "null",
+                "sec-fetch-site": "same-origin",
+            },
+        )
+        self.assertTrue(is_trusted_write_request(request))
+
+    def test_cross_site_browser_write_with_null_origin_is_rejected(self):
+        request = _build_request(
+            host="127.0.0.1",
+            method="POST",
+            headers={
+                "host": "127.0.0.1:8000",
+                "origin": "null",
+                "sec-fetch-site": "cross-site",
+            },
+        )
+        self.assertFalse(is_trusted_write_request(request))
+
+    def test_null_origin_without_same_origin_browser_signal_is_rejected(self):
+        request = _build_request(
+            host="127.0.0.1",
+            method="POST",
+            headers={"host": "127.0.0.1:8000", "origin": "null"},
+        )
+        self.assertFalse(is_trusted_write_request(request))
+
+    def test_non_browser_authenticated_client_without_origin_is_allowed(self):
+        request = _build_request(host="127.0.0.1", method="POST")
+        self.assertTrue(is_trusted_write_request(request))
+
+    def test_security_headers_include_csp_and_clickjacking_protection(self):
+        request = _build_request(host="127.0.0.1", scheme="https")
+        headers = security_response_headers(request)
+        self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
+        self.assertEqual(headers["X-Frame-Options"], "DENY")
+        self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(headers["Referrer-Policy"], "same-origin")
+        self.assertIn("Strict-Transport-Security", headers)
+
     def test_secret_key_file_defaults_to_runtime_directory(self):
         os.environ.pop(SMTP_SECRET_KEY_ENV, None)
         os.environ.pop(SMTP_SECRET_FILE_ENV, None)
@@ -118,13 +202,39 @@ class SecurityTests(unittest.TestCase):
             finally:
                 os.chdir(old_cwd)
 
+    def test_windows_key_file_acl_hardening_uses_icacls(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            key_path = Path(tmpdir) / SMTP_SECRET_FILE_DEFAULT
+            with patch("security.os.name", "nt"), \
+                 patch("security.os.environ", dict(os.environ, USERNAME="tester")), \
+                 patch("security.subprocess.run") as run_mock:
+                security._write_key_file(key_path, b"secret-key")
+
+            run_mock.assert_called_once()
+            args = run_mock.call_args.args[0]
+            self.assertEqual(args[0], "icacls")
+            self.assertIn(str(key_path), args)
+
+    def test_windows_key_file_acl_failure_logs_warning(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            key_path = Path(tmpdir) / SMTP_SECRET_FILE_DEFAULT
+            with patch("security.os.name", "nt"), \
+                 patch("security.os.environ", dict(os.environ, USERNAME="tester")), \
+                 patch("security.subprocess.run", side_effect=subprocess.CalledProcessError(1, "icacls")), \
+                 patch("security.logger.warning") as warning_mock:
+                security._write_key_file(key_path, b"secret-key")
+
+            warning_mock.assert_called()
+
 
 class ValidateMonitorTargetUrlTests(unittest.TestCase):
     def setUp(self):
         security._host_validation_cache.clear()
+        os.environ.pop(ALLOW_PRIVATE_PROXY_ENV, None)
 
     def tearDown(self):
         security._host_validation_cache.clear()
+        os.environ.pop(ALLOW_PRIVATE_PROXY_ENV, None)
 
     def _valid(self, url: str) -> str:
         with patch("security.socket.getaddrinfo", return_value=_PUBLIC_DNS):
@@ -171,6 +281,17 @@ class ValidateMonitorTargetUrlTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "private"):
                 validate_monitor_target_url("https://evil.example.com/")
 
+    def test_force_dns_refresh_bypasses_cached_public_host(self):
+        with patch("security.socket.getaddrinfo", return_value=_PUBLIC_DNS):
+            validate_monitor_target_url("https://rebind.example.com/")
+
+        with patch("security.socket.getaddrinfo", return_value=_PRIVATE_DNS):
+            with self.assertRaisesRegex(ValueError, "private"):
+                validate_monitor_target_url(
+                    "https://rebind.example.com/",
+                    force_dns_refresh=True,
+                )
+
     def test_loopback_ip_via_dns_rejected(self):
         with patch("security.socket.getaddrinfo", return_value=_LOOPBACK_DNS):
             with self.assertRaisesRegex(ValueError, "private"):
@@ -197,6 +318,27 @@ class ValidateMonitorTargetUrlTests(unittest.TestCase):
     def test_empty_url_rejected(self):
         with self.assertRaises(ValueError):
             validate_monitor_target_url("")
+
+    def test_public_proxy_url_accepted(self):
+        with patch("security.socket.getaddrinfo", return_value=_PUBLIC_DNS):
+            result = validate_proxy_url("http://proxy.example.com:7890")
+        self.assertEqual(result, "http://proxy.example.com:7890")
+
+    def test_private_proxy_url_rejected_by_default(self):
+        with self.assertRaisesRegex(ValueError, "(?i)private"):
+            validate_proxy_url("http://192.168.0.2:3128")
+
+    def test_loopback_proxy_is_accepted_by_default(self):
+        result = validate_proxy_url("http://127.0.0.1:7890")
+        self.assertEqual(result, "http://127.0.0.1:7890")
+
+    def test_localhost_proxy_is_accepted_by_default(self):
+        result = validate_proxy_url("http://localhost:7890")
+        self.assertEqual(result, "http://localhost:7890")
+
+    def test_ipv6_loopback_proxy_is_accepted_by_default(self):
+        result = validate_proxy_url("http://[::1]:7890")
+        self.assertEqual(result, "http://[::1]:7890")
 
 
 class IsValidEmailTests(unittest.TestCase):

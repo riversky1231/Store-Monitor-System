@@ -9,32 +9,32 @@ def handle_empty_scrape_result(
     task,
     *,
     empty_alert_threshold: int,
-    send_health_alert,
+    failure_threshold: int,
 ) -> None:
     """Handle case when scrape returns no products."""
     now = datetime.datetime.now(datetime.timezone.utc)
-    count = (task.consecutive_empty_count or 0) + 1
-    task.consecutive_empty_count = count
-    task.health_state = "alert" if count >= empty_alert_threshold else "warning"
+    empty_count = (task.consecutive_empty_count or 0) + 1
+    failure_count = (task.consecutive_failure_count or 0) + 1
+    task.consecutive_empty_count = empty_count
+    task.consecutive_failure_count = failure_count
+    task.last_failure_at = now
+    task.last_failure_reason = "抓取结果为空"
+    task.manual_review_pending = True
+    if failure_count >= failure_threshold:
+        task.health_state = "failed"
+    else:
+        task.health_state = "alert" if empty_count >= empty_alert_threshold else "warning"
 
     logger.warning(
-        "Task %s: scrape returned 0 products (consecutive=%d/%d).",
+        "Task %s: scrape returned 0 products (empty=%d/%d, failure=%d/%d).",
         task.name,
-        count,
+        empty_count,
         empty_alert_threshold,
+        failure_count,
+        failure_threshold,
     )
 
-    if count == empty_alert_threshold:
-        task.last_health_alert_at = now
-        logger.error(
-            "Task %s reached %d consecutive empty scrapes. Sending health alert.",
-            task.name,
-            count,
-        )
-        db.commit()
-        send_health_alert(db, task, count)
-    else:
-        db.commit()
+    db.commit()
 
 
 def handle_successful_scrape(
@@ -56,32 +56,46 @@ def handle_successful_scrape(
 
     prev_count = task.consecutive_empty_count or 0
     if prev_count >= empty_alert_threshold:
-        send_recovery_notification(db, task, prev_count)
+        # Manual-only mode sends one batch report instead of a second recovery email.
         task.last_recovery_at = now
 
     task.consecutive_empty_count = 0
+    task.consecutive_failure_count = 0
     task.health_state = "healthy"
+    task.manual_review_pending = False
+    task.manual_review_kind = None
+    task.manual_review_scope_key = None
+    task.manual_review_scope_label = None
+    task.manual_review_scope_kind = None
+    task.manual_review_started_at = None
+    task.last_failure_at = None
+    task.last_failure_reason = None
     task.last_run_at = now
-    task.next_run_at = now + datetime.timedelta(hours=task.check_interval_hours)
+    task.next_run_at = None
     db.commit()
 
     if new_products or removed_products:
         logger.info(
-            "Task %s: new=%d, removed=%d, queuing for digest.",
+            "Task %s: new=%d, removed=%d, queuing manual completion report.",
             task.name,
             len(new_products),
             len(removed_products),
         )
-        queue_digest_entry(task.name, new_products, removed_products, is_baseline=False)
     elif is_first_successful_run:
         logger.info(
-            "Task %s: baseline scrape completed with %d products. Queuing initial digest.",
+            "Task %s: baseline scrape completed with %d products. Queuing manual completion report.",
             task.name,
             len(current),
         )
-        if is_queue_worker_thread():
-            queue_digest_entry(task.name, [], [], is_baseline=True, baseline_count=len(current))
-        else:
-            send_email(db, task, current, [])
     else:
-        logger.info("Task %s: no changes detected.", task.name)
+        logger.info("Task %s: no changes detected; queuing manual completion report.", task.name)
+
+    queue_digest_entry(
+        task,
+        new_products,
+        removed_products,
+        is_baseline=is_first_successful_run,
+        baseline_count=len(current) if is_first_successful_run else 0,
+        current_products=current,
+        status="success",
+    )

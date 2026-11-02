@@ -1,3 +1,7 @@
+from pathlib import Path
+
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import create_engine, text
 
 from database import (
@@ -91,6 +95,78 @@ def test_ensure_column_accepts_current_system_config_columns():
         columns = {row[1] for row in conn.execute(text("PRAGMA table_info(system_configs)"))}
 
     assert {"smtp_server", "smtp_port", "sender_email", "sender_password"}.issubset(columns)
+
+
+def test_ensure_column_accepts_product_new_discovery_flag():
+    engine = create_engine("sqlite:///:memory:")
+    with engine.connect() as conn:
+        conn.execute(text("CREATE TABLE product_items (id INTEGER PRIMARY KEY)"))
+        conn.commit()
+
+        _ensure_column(conn, "product_items", "is_new_discovery", "BOOLEAN DEFAULT 0")
+
+        columns = {row[1] for row in conn.execute(text("PRAGMA table_info(product_items)"))}
+
+    assert "is_new_discovery" in columns
+
+
+def test_ensure_column_accepts_task_sort_order():
+    engine = create_engine("sqlite:///:memory:")
+    with engine.connect() as conn:
+        conn.execute(text("CREATE TABLE monitor_tasks (id INTEGER PRIMARY KEY)"))
+        conn.commit()
+
+        _ensure_column(conn, "monitor_tasks", "sort_order", "INTEGER DEFAULT 0")
+
+        columns = {row[1] for row in conn.execute(text("PRAGMA table_info(monitor_tasks)"))}
+        default_value = conn.execute(
+            text("SELECT dflt_value FROM pragma_table_info('monitor_tasks') WHERE name = 'sort_order'")
+        ).scalar_one()
+
+    assert "sort_order" in columns
+    assert default_value == "0"
+
+
+def test_task_sort_order_migration_backfills_id_order_per_group(tmp_path):
+    database_path = tmp_path / "migration.db"
+    project_dir = Path(__file__).resolve().parents[1]
+    config = Config(str(project_dir / "alembic.ini"))
+    config.set_main_option("script_location", str(project_dir / "alembic"))
+    config.set_main_option("sqlalchemy.url", f"sqlite:///{database_path.as_posix()}")
+
+    command.upgrade(config, "20260831_0011")
+    engine = create_engine(f"sqlite:///{database_path.as_posix()}")
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO categories (id, name) VALUES (1, 'A'), (2, 'B')"))
+        conn.execute(
+            text(
+                """
+                INSERT INTO monitor_tasks (id, name, category_id) VALUES
+                (10, 'A-1', 1),
+                (20, 'B-1', 2),
+                (30, 'A-2', 1),
+                (40, 'A-3', 1),
+                (50, 'B-2', 2)
+                """
+            )
+        )
+    engine.dispose()
+
+    command.upgrade(config, "head")
+    engine = create_engine(f"sqlite:///{database_path.as_posix()}")
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT id, category_id, sort_order FROM monitor_tasks ORDER BY id")
+        ).fetchall()
+    engine.dispose()
+
+    assert rows == [
+        (10, 1, 0),
+        (20, 2, 0),
+        (30, 1, 1),
+        (40, 1, 2),
+        (50, 2, 1),
+    ]
 
 
 def test_migrate_legacy_system_config_columns_backfills_renamed_fields():

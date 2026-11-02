@@ -23,7 +23,8 @@
     创建分组
   </button>
   <form action="/tasks/run-all" method="post" style="display:inline"
-        onsubmit="return confirm('确认执行全部已启用的监控任务？\n全部完成后将发送一封综合报告。')">
+        onsubmit="return confirm('确认执行全部已启用的监控任务？\n全部完成后将按分组分别发送报告，每个分组一封。')">
+    <input type="hidden" name="next" value="{{ current_path_query }}">
     <button type="submit" class="btn" style="background:#059669;color:#fff">
       <svg viewBox="0 0 24 24" fill="currentColor" width="15" height="15"><path d="M8 5v14l11-7z"/></svg>
       全部执行
@@ -31,6 +32,7 @@
   </form>
   <form action="/tasks/queue/stop" method="post" style="display:inline" id="stopForm"
         onsubmit="return confirmAndStop()">
+    <input type="hidden" name="next" value="{{ current_path_query }}">
     <button type="submit" class="btn" style="background:#dc2626;color:#fff">
       <svg viewBox="0 0 24 24" fill="currentColor" width="15" height="15"><path d="M6 6h12v12H6z"/></svg>
       强制停止
@@ -42,7 +44,13 @@
 {% block content %}
 
 {% if request.query_params.get('run_all') %}
-<div class="alert alert-ok">已将 {{ request.query_params.get('queued') | e }} 个任务加入执行队列，全部完成后将发送一封综合报告邮件。</div>
+<div class="alert alert-ok">已将 {{ request.query_params.get('queued') | e }} 个任务加入执行队列；完成后将按分组发送 {{ request.query_params.get('reports') | e }} 封报告邮件，每封包含该分组的全部商品链接。</div>
+{% endif %}
+{% if request.query_params.get('run_started') %}
+<div class="alert alert-ok">任务已加入执行队列。</div>
+{% endif %}
+{% if request.query_params.get('already_running') %}
+<div class="alert alert-info">该任务已在运行队列中。</div>
 {% endif %}
 {% if request.query_params.get('queue_stopped') %}
 <div class="alert alert-info">
@@ -71,6 +79,9 @@
 {% if request.query_params.get('pending_cleared') %}
 <div class="alert alert-ok">已清空待分配列表。</div>
 {% endif %}
+{% if request.query_params.get('review_ignored') %}
+<div class="alert alert-ok">已忽略本次结果；保留上次运行记忆，任务已恢复待手动执行。</div>
+{% endif %}
 {% if request.query_params.get('error') %}
 <div class="alert alert-err">{{ request.query_params.get('error') | e }}</div>
 {% endif %}
@@ -86,6 +97,7 @@
     </span>
     <form action="/tasks/clear-pending" method="post" style="display:inline"
           onsubmit="return confirm('确认清空全部待分配店铺？此操作不可恢复。')">
+      <input type="hidden" name="next" value="{{ current_path_query }}">
       <button type="submit" class="btn btn-ghost" style="font-size:12px;color:#dc2626">清空待分配</button>
     </form>
   </div>
@@ -118,6 +130,59 @@
   </div>
 </div>
 
+{% if locate_query %}
+<div class="card locate-results" style="padding:12px 16px;margin-bottom:16px">
+  {% if request.query_params.get('locate_error') %}
+  <strong>没有找到匹配的店铺或分组。</strong>
+  {% elif location_results|length == 1 and not location_results[0].category_id %}
+  <strong>找到任务，但它尚未分配到分组。</strong>
+  {% else %}
+  <strong>定位结果：{{ locate_query|e }}</strong>
+  <div class="locate-result-list">
+    {% for task in location_results %}
+    {% if task.category_id %}
+    <a class="locate-result" href="{{ task_focus_url(task) }}">
+      <span>{{ task.name|e }}</span>
+      <small>{{ task.group.name if task.group else '未分组' }}</small>
+    </a>
+    {% else %}
+    <div class="locate-result locate-result-disabled">
+      <span>{{ task.name|e }}</span>
+      <small>未分组</small>
+    </div>
+    {% endif %}
+    {% endfor %}
+  </div>
+  {% endif %}
+</div>
+{% endif %}
+
+<!-- 报告发送状态 -->
+<div id="reportDeliveryPanel" class="card" style="padding:12px 16px;margin-bottom:16px;display:none">
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:14px;flex-wrap:wrap">
+    <div style="display:flex;align-items:center;gap:8px;min-width:0;flex:1">
+      <strong id="reportDeliveryTitle" style="white-space:nowrap">邮件报告状态</strong>
+      <span id="reportDeliveryText" class="txt-m txt-s"></span>
+    </div>
+    <div class="report-delivery-head-actions">
+      <button id="reportRetryBtn" type="button" class="btn btn-ghost" style="display:none"
+              onclick="retryReportDelivery()">立即补发</button>
+      <button id="reportCollapseBtn" type="button" class="btn btn-ghost report-collapse-btn"
+              aria-expanded="true" aria-controls="reportDeliveryBody" title="折叠邮件报告记录">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true">
+          <path d="m6 9 6 6 6-6" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span id="reportCollapseLabel">折叠</span>
+      </button>
+    </div>
+  </div>
+  <div id="reportDeliveryBody">
+    <div id="reportDeliveryFeedback" class="txt-s" style="display:none;margin-top:8px"></div>
+    <div id="reportDeliveryList" class="report-delivery-list"></div>
+    <div id="reportDeliveryPagination" class="report-delivery-pagination" hidden></div>
+  </div>
+</div>
+
 <!-- 运行队列 -->
 <div id="queuePanel" class="card" style="padding:12px 16px;margin-bottom:16px;display:none">
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
@@ -129,6 +194,114 @@
     </span>
   </div>
   <div id="qList" class="q-scroll"></div>
+</div>
+
+<div class="issue-grid">
+  <div class="card issue-card">
+    <div class="issue-card-hd">
+      <div>
+        <strong>抓取异常列表</strong>
+        <span class="issue-sub">待人工确认的任务不会自动重试，可手动设为正常、忽略本次或重新执行</span>
+      </div>
+      <span class="issue-count warn">{{ abnormal_tasks|length }}</span>
+    </div>
+    {% if abnormal_tasks %}
+    <div class="issue-list">
+      {% for item in abnormal_tasks %}
+      <div class="issue-row" data-task-id="{{ item.id }}">
+        <div class="issue-main">
+          <div class="issue-name-row">
+            <strong>{{ item.name }}</strong>
+            <span class="issue-badge issue-badge-{{ item.execution_state }}" data-task-state data-initial-state="{{ item.execution_state }}">
+              {% if item.execution_state == 'running' %}执行中{% elif item.execution_state == 'waiting' %}排队中{% elif item.execution_state == 'manual' %}待确认{% else %}空闲{% endif %}
+            </span>
+          </div>
+          <div class="issue-meta">
+            <span>{{ item.group_name }}</span>
+            <span>{{ item.status_text }}</span>
+            {% if item.reason %}<span title="{{ item.reason }}">{{ item.reason }}</span>{% endif %}
+            {% if item.updated_at %}<span>{{ item.updated_at|beijing }}</span>{% endif %}
+          </div>
+        </div>
+        <div class="issue-actions">
+          {% if item.task.manual_review_pending %}
+          <form action="/tasks/{{ item.id }}/accept-manual-review" method="post" style="display:inline">
+            <input type="hidden" name="next" value="{{ current_path_query }}">
+            <button type="submit" class="btn btn-ghost issue-act-btn">正常</button>
+          </form>
+          <form action="/tasks/{{ item.id }}/ignore-manual-review" method="post" style="display:inline"
+                onsubmit="return confirm('忽略「{{ item.name|e }}」本次结果？\n会保留上次运行记忆，不把这次待确认结果作为新基线。')">
+            <input type="hidden" name="next" value="{{ current_path_query }}">
+            <button type="submit" class="btn btn-ghost issue-act-btn">忽略本次</button>
+          </form>
+          <form action="/tasks/{{ item.id }}/retry-manual-review" method="post" style="display:inline">
+            <input type="hidden" name="next" value="{{ current_path_query }}">
+            <button type="submit" class="btn btn-ghost issue-act-btn">重试</button>
+          </form>
+          {% else %}
+          <form action="/tasks/{{ item.id }}/run" method="post" style="display:inline">
+            <input type="hidden" name="next" value="{{ current_path_query }}">
+            <button type="submit" class="btn btn-ghost issue-act-btn">执行</button>
+          </form>
+          {% endif %}
+          {% if item.group_url %}
+          <a href="{{ item.group_url }}" class="btn btn-ghost issue-act-btn">查看分组</a>
+          {% endif %}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="issue-empty">当前没有抓取异常任务。</div>
+    {% endif %}
+  </div>
+
+  <div class="card issue-card">
+    <div class="issue-card-hd">
+      <div>
+        <strong>失败列表</strong>
+        <span class="issue-sub">失败任务需要人工判断是设为正常还是手动重试</span>
+      </div>
+      <span class="issue-count fail">{{ failed_tasks|length }}</span>
+    </div>
+    {% if failed_tasks %}
+    <div class="issue-list">
+      {% for item in failed_tasks %}
+      <div class="issue-row" data-task-id="{{ item.id }}">
+        <div class="issue-main">
+          <div class="issue-name-row">
+            <strong>{{ item.name }}</strong>
+            <span class="issue-badge issue-badge-{{ item.execution_state }}" data-task-state data-initial-state="{{ item.execution_state }}">
+              {% if item.execution_state == 'running' %}执行中{% elif item.execution_state == 'waiting' %}排队中{% elif item.execution_state == 'manual' %}待确认{% else %}空闲{% endif %}
+            </span>
+          </div>
+          <div class="issue-meta">
+            <span>{{ item.group_name }}</span>
+            <span>{{ item.status_text }}</span>
+            {% if item.reason %}<span title="{{ item.reason }}">{{ item.reason }}</span>{% endif %}
+            {% if item.updated_at %}<span>{{ item.updated_at|beijing }}</span>{% endif %}
+          </div>
+        </div>
+        <div class="issue-actions">
+          <form action="/tasks/{{ item.id }}/reset-health" method="post" style="display:inline">
+            <input type="hidden" name="next" value="{{ current_path_query }}">
+            <button type="submit" class="btn btn-ghost issue-act-btn">正常</button>
+          </form>
+          <form action="/tasks/{{ item.id }}/run" method="post" style="display:inline">
+            <input type="hidden" name="next" value="{{ current_path_query }}">
+            <button type="submit" class="btn btn-ghost issue-act-btn">重试</button>
+          </form>
+          {% if item.group_url %}
+          <a href="{{ item.group_url }}" class="btn btn-ghost issue-act-btn">查看分组</a>
+          {% endif %}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="issue-empty">当前没有失败任务。</div>
+    {% endif %}
+  </div>
 </div>
 
 {% if groups %}
@@ -147,6 +320,7 @@
         onclick="event.stopPropagation();event.preventDefault();openRename({{ g.id }},'{{ g.name|e }}')">✎</button>
       <form action="/tasks/group/{{ g.id }}/delete" method="post"
             onclick="event.stopPropagation();event.preventDefault();if(confirm('删除分组「{{ g.name|e }}」及其所有任务？'))this.submit()">
+        <input type="hidden" name="next" value="{{ current_path_query }}">
         <button type="button" class="ibt del" title="删除分组" style="font-size:14px">✕</button>
       </form>
     </div>
@@ -172,6 +346,7 @@
     </div>
     <div class="modal-bd">
       <form id="createF" action="/tasks/group-create" method="post">
+        <input type="hidden" name="next" value="{{ current_path_query }}">
         <div class="form-blk">
           <label>分组名称</label>
           <input type="text" name="name" class="inp" placeholder="例：电子产品、家居用品" required autofocus>
@@ -201,6 +376,7 @@
         </ul>
       </div>
       <form id="importF" action="/tasks/group-import" method="post" enctype="multipart/form-data">
+        <input type="hidden" name="next" value="{{ current_path_query }}">
         <div class="form-blk">
           <label>目标分组 <span style="font-weight:400;color:var(--text-muted)">（仅旧版数据库需要选择）</span></label>
           <select name="group_id" class="inp">
@@ -241,6 +417,7 @@
     </div>
     <div class="modal-bd">
       <form id="renameF" method="post">
+        <input type="hidden" name="next" value="{{ current_path_query }}">
         <div class="form-blk">
           <label>分组名称</label>
           <input type="text" id="r-name" name="name" class="inp" required autofocus>
@@ -261,6 +438,46 @@
 .q-item{display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border-radius:20px;font-size:12px;font-weight:600;white-space:nowrap;flex-shrink:0}
 .q-run{background:#dcfce7;color:#166534}.q-run i{width:7px;height:7px;border-radius:50%;background:#16a34a;display:inline-block;animation:q-pulse 1.2s infinite}
 .q-wait{background:#f0f6ff;color:#1d4ed8}.q-wait i{width:7px;height:7px;border-radius:50%;background:#93c5fd;display:inline-block}
+.issue-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;margin-bottom:16px}
+.issue-card{padding:14px 16px}
+.issue-card-hd{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:10px}
+.issue-sub{display:block;margin-top:4px;color:var(--text-sub);font-size:12px;font-weight:400}
+.issue-count{display:inline-flex;align-items:center;justify-content:center;min-width:28px;height:28px;padding:0 10px;border-radius:999px;font-size:12px;font-weight:700}
+.issue-count.warn{background:#fef3c7;color:#b45309}
+.issue-count.fail{background:#fee2e2;color:#b91c1c}
+.issue-list{display:flex;flex-direction:column;gap:10px}
+.issue-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px;border:1px solid var(--border);border-radius:12px;background:#fafcff}
+.issue-main{min-width:0;flex:1}
+.issue-name-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.issue-meta{display:flex;gap:10px;flex-wrap:wrap;margin-top:6px;font-size:12px;color:var(--text-sub)}
+.issue-meta span{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.issue-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.issue-act-btn{font-size:12px;padding:7px 12px}
+.issue-empty{padding:18px 8px;color:var(--text-sub);font-size:13px}
+.issue-badge{display:inline-flex;align-items:center;justify-content:center;padding:3px 8px;border-radius:999px;font-size:11px;font-weight:700;text-transform:none}
+.issue-badge-running{background:#dcfce7;color:#166534}
+.issue-badge-waiting{background:#dbeafe;color:#1d4ed8}
+.issue-badge-manual{background:#fef3c7;color:#b45309}
+.issue-badge-idle{background:#e5e7eb;color:#4b5563}
+.report-delivery-list{display:grid;gap:8px;margin-top:10px}
+.report-delivery-head-actions{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.report-collapse-btn{padding:8px 11px}
+.report-collapse-btn svg{width:15px;height:15px;transition:transform .18s ease}
+.report-collapse-btn[aria-expanded="false"] svg{transform:rotate(-90deg)}
+#reportDeliveryBody[hidden]{display:none}
+.report-delivery-row{display:grid;grid-template-columns:minmax(180px,1fr) auto;align-items:center;gap:12px;padding:10px 0;border-top:1px solid var(--line)}
+.report-delivery-main{min-width:0}
+.report-delivery-name{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:13px;color:var(--text-main)}
+.report-delivery-meta{display:flex;gap:10px;flex-wrap:wrap;margin-top:5px;font-size:12px;color:var(--text-sub)}
+.report-delivery-error{margin-top:5px;font-size:12px;color:#b91c1c;overflow-wrap:anywhere}
+.report-delivery-pagination{display:flex;align-items:center;justify-content:center;gap:10px;margin-top:12px;padding-top:10px;border-top:1px solid var(--line);font-size:12px;color:var(--text-sub)}
+.report-delivery-pagination button{min-width:64px}
+.report-state{display:inline-flex;padding:3px 8px;border-radius:999px;font-size:11px;font-weight:700}
+.report-state-sent{background:#dcfce7;color:#166534}
+.report-state-failed{background:#fee2e2;color:#b91c1c}
+.report-state-pending,.report-state-sending{background:#dbeafe;color:#1d4ed8}
+.report-state-held_review{background:#fef3c7;color:#b45309}
+@media(max-width:640px){.report-delivery-row{grid-template-columns:1fr}.report-delivery-row .btn{justify-self:start}}
 @keyframes q-pulse{0%,100%{opacity:1}50%{opacity:.3}}
 @keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
 .group-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px;padding:4px}
@@ -289,6 +506,27 @@ function submitImport() {
 }
 /* --- Queue panel polling --- */
 var _qData = [];
+var _reportCollapsed = false;
+try {
+  _reportCollapsed = window.localStorage.getItem('reportDeliveryCollapsed') === '1';
+} catch (error) {}
+function _applyReportCollapsedState() {
+  var body = document.getElementById('reportDeliveryBody');
+  var button = document.getElementById('reportCollapseBtn');
+  var label = document.getElementById('reportCollapseLabel');
+  body.hidden = _reportCollapsed;
+  button.setAttribute('aria-expanded', _reportCollapsed ? 'false' : 'true');
+  button.title = _reportCollapsed ? '展开邮件报告记录' : '折叠邮件报告记录';
+  label.textContent = _reportCollapsed ? '展开' : '折叠';
+}
+document.getElementById('reportCollapseBtn').addEventListener('click', function() {
+  _reportCollapsed = !_reportCollapsed;
+  _applyReportCollapsedState();
+  try {
+    window.localStorage.setItem('reportDeliveryCollapsed', _reportCollapsed ? '1' : '0');
+  } catch (error) {}
+});
+_applyReportCollapsedState();
 function _renderQueue() {
   var panel = document.getElementById('queuePanel');
   var list = document.getElementById('qList');
@@ -296,12 +534,232 @@ function _renderQueue() {
   if (!_qData.length) { panel.style.display = 'none'; return; }
   panel.style.display = '';
   totalEl.textContent = '(' + _qData.length + ')';
-  list.innerHTML = _qData.map(function(it) {
-    var cls = it.status === 'running' ? 'q-run' : 'q-wait';
+  list.innerHTML = '';
+  _qData.forEach(function(it) {
+    var span = document.createElement('span');
+    span.className = 'q-item ' + (it.status === 'running' ? 'q-run' : 'q-wait');
+    span.appendChild(document.createElement('i'));
     var label = it.status === 'running' ? '运行中' : '等待中';
-    return '<span class="q-item ' + cls + '"><i></i>' + label + '：' + it.name + '</span>';
-  }).join('');
+    span.appendChild(document.createTextNode(label + '：' + (it.name || '')));
+    list.appendChild(span);
+  });
 }
+function _updateIssueRows() {
+  var stateMap = {};
+  (_qData || []).forEach(function(item) { stateMap[String(item.id)] = item.status; });
+  document.querySelectorAll('.issue-row[data-task-id]').forEach(function(row) {
+    var id = row.getAttribute('data-task-id');
+    var badge = row.querySelector('[data-task-state]');
+    if (!badge) return;
+    var state = stateMap[id];
+    var label = badge.getAttribute('data-initial-state') || 'idle';
+    if (state === 'running') label = 'running';
+    else if (state === 'waiting') label = 'waiting';
+    badge.className = 'issue-badge issue-badge-' + label;
+    badge.textContent = label === 'running' ? '执行中' : label === 'waiting' ? '排队中' : label === 'manual' ? '待确认' : '空闲';
+  });
+}
+function _renderReportDelivery(status) {
+  var panel = document.getElementById('reportDeliveryPanel');
+  var title = document.getElementById('reportDeliveryTitle');
+  var text = document.getElementById('reportDeliveryText');
+  var retryBtn = document.getElementById('reportRetryBtn');
+  status = status || {};
+  _reportPage = Number(status.page || _reportPage || 1);
+  _renderReportDeliveryList(status.reports || []);
+  _renderReportPagination(status);
+  var unsent = Number(status.unsent_count || 0);
+  var held = Number(status.held_count || 0);
+  if (unsent > 0) {
+    panel.style.display = '';
+    panel.style.borderColor = Number(status.failed_count || 0) > 0 ? '#fecaca' : '#fde68a';
+    title.textContent = Number(status.failed_count || 0) > 0 ? '邮件报告待补发' : '邮件报告发送中';
+    text.textContent = '共有 ' + unsent + ' 份未送达；系统会在启动和下次手动运行时自动重试。' +
+      (status.latest_scope ? ' 最近分组：' + status.latest_scope + '。' : '') +
+      (status.latest_error ? ' ' + status.latest_error : '');
+    retryBtn.style.display = '';
+    retryBtn.disabled = _reportRetrying;
+    retryBtn.textContent = _reportRetrying ? '补发中…' : '立即补发';
+    return;
+  }
+  retryBtn.style.display = 'none';
+  if (held > 0) {
+    panel.style.display = '';
+    panel.style.borderColor = '#fde68a';
+    title.textContent = '完整报告等待人工确认';
+    text.textContent = '共有 ' + held + ' 个分组批次已发送提醒邮件；全部待确认店铺处理完成后才会发送完整报告。' +
+      (status.latest_held_scope ? ' 最近分组：' + status.latest_held_scope + '。' : '');
+    return;
+  }
+  if (status.latest_sent_at || (status.reports || []).length) {
+    panel.style.display = '';
+    panel.style.borderColor = '#bbf7d0';
+    title.textContent = '邮件报告记录';
+    text.textContent = '“服务器已接受”不等于收件箱确认；未收到时可对单条报告再次发送。';
+    return;
+  }
+  panel.style.display = 'none';
+}
+var _reportRetrying = false;
+var _reportRetryingId = null;
+var _reportPage = 1;
+function _reportTime(value) {
+  if (!value) return '';
+  var date = new Date(value);
+  return isNaN(date.getTime()) ? '' : date.toLocaleString('zh-CN', {hour12:false});
+}
+function _renderReportDeliveryList(reports) {
+  var list = document.getElementById('reportDeliveryList');
+  list.innerHTML = '';
+  var labels = {
+    sent: '服务器已接受', failed: '发送失败', pending: '等待发送',
+    sending: '发送中', held_review: '等待人工确认'
+  };
+  reports.forEach(function(report) {
+    var row = document.createElement('div');
+    row.className = 'report-delivery-row';
+    var main = document.createElement('div');
+    main.className = 'report-delivery-main';
+    var name = document.createElement('div');
+    name.className = 'report-delivery-name';
+    var strong = document.createElement('strong');
+    strong.textContent = report.scope_label || '未命名报告';
+    var badge = document.createElement('span');
+    badge.className = 'report-state report-state-' + (report.status || 'pending');
+    badge.textContent = labels[report.status] || report.status || '未知';
+    name.appendChild(strong);
+    name.appendChild(badge);
+    main.appendChild(name);
+    var meta = document.createElement('div');
+    meta.className = 'report-delivery-meta';
+    var type = report.scope_kind === 'review_reminder' ? '人工确认提醒' : '完整报告';
+    var time = _reportTime(report.sent_at || report.last_attempt_at || report.created_at);
+    meta.textContent = type + ' · 已尝试 ' + Number(report.attempt_count || 0) + ' 次' + (time ? ' · ' + time : '');
+    main.appendChild(meta);
+    if (report.last_error) {
+      var error = document.createElement('div');
+      error.className = 'report-delivery-error';
+      error.textContent = report.last_error;
+      main.appendChild(error);
+    }
+    row.appendChild(main);
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn btn-ghost btn-xs';
+    button.setAttribute('data-report-retry-id', String(report.id));
+    button.disabled = !report.can_retry || _reportRetryingId === report.id;
+    button.textContent = _reportRetryingId === report.id ? '发送中...' :
+      (report.status === 'held_review' ? '待确认' : report.status === 'sent' ? '再次发送' : '补发');
+    row.appendChild(button);
+    list.appendChild(row);
+  });
+}
+function _renderReportPagination(status) {
+  var pagination = document.getElementById('reportDeliveryPagination');
+  var totalPages = Number(status.total_pages || 1);
+  var page = Number(status.page || 1);
+  if (totalPages <= 1) {
+    pagination.hidden = true;
+    pagination.innerHTML = '';
+    return;
+  }
+  pagination.hidden = false;
+  pagination.innerHTML = '';
+  var previous = document.createElement('button');
+  previous.type = 'button';
+  previous.className = 'btn btn-ghost btn-xs';
+  previous.textContent = '上一页';
+  previous.disabled = page <= 1;
+  previous.setAttribute('data-report-page', String(page - 1));
+  var label = document.createElement('span');
+  label.textContent = page + ' / ' + totalPages + '（共 ' + Number(status.total_reports || 0) + ' 条）';
+  var next = document.createElement('button');
+  next.type = 'button';
+  next.className = 'btn btn-ghost btn-xs';
+  next.textContent = '下一页';
+  next.disabled = page >= totalPages;
+  next.setAttribute('data-report-page', String(page + 1));
+  pagination.appendChild(previous);
+  pagination.appendChild(label);
+  pagination.appendChild(next);
+}
+function _showReportRetryFeedback(message, isError) {
+  var feedback = document.getElementById('reportDeliveryFeedback');
+  feedback.style.display = message ? '' : 'none';
+  feedback.style.color = isError ? '#dc2626' : '#047857';
+  feedback.textContent = message || '';
+}
+function retryReportDelivery() {
+  if (_reportRetrying) return;
+  _reportRetrying = true;
+  _showReportRetryFeedback('正在连接邮件服务器并补发，请稍候…', false);
+  var btn = document.getElementById('reportRetryBtn');
+  btn.disabled = true;
+  btn.textContent = '补发中…';
+  fetch('/api/report-delivery/retry?report_page=' + encodeURIComponent(_reportPage), {
+    method: 'POST',
+    headers: {'Accept': 'application/json'}
+  }).then(function(response) {
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    return response.json();
+  }).then(function(result) {
+    _renderReportDelivery(result.report_delivery || {});
+    if (result.busy) {
+      _showReportRetryFeedback('邮件正在由另一个操作发送，请稍后查看状态。', false);
+    } else if (!result.attempted) {
+      _showReportRetryFeedback('当前没有可补发的邮件。等待人工确认的完整报告不会提前发送。', false);
+    } else if (result.failed) {
+      _showReportRetryFeedback('已尝试补发，但仍有 ' + result.failed + ' 份失败；具体原因已显示在上方。', true);
+    } else {
+      _showReportRetryFeedback('补发成功，共送达 ' + result.sent + ' 份邮件。', false);
+    }
+  }).catch(function() {
+    _showReportRetryFeedback('补发请求失败，请确认程序仍在运行后重试。', true);
+  }).finally(function() {
+    _reportRetrying = false;
+    btn.disabled = false;
+    btn.textContent = '立即补发';
+    _pollQueue();
+  });
+}
+document.getElementById('reportDeliveryList').addEventListener('click', function(event) {
+  var button = event.target.closest('[data-report-retry-id]');
+  if (!button || button.disabled || _reportRetryingId !== null) return;
+  var reportId = Number(button.getAttribute('data-report-retry-id'));
+  _reportRetryingId = reportId;
+  button.disabled = true;
+  button.textContent = '发送中...';
+  _showReportRetryFeedback('正在再次发送这份报告，请稍候...', false);
+  fetch('/api/report-delivery/' + reportId + '/retry?report_page=' + encodeURIComponent(_reportPage), {
+    method: 'POST',
+    headers: {'Accept': 'application/json'}
+  }).then(function(response) {
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    return response.json();
+  }).then(function(result) {
+    _renderReportDelivery(result.report_delivery || {});
+    if (result.busy) {
+      _showReportRetryFeedback('邮件正在发送，请稍后再试。', false);
+    } else if (result.unavailable) {
+      _showReportRetryFeedback('这份旧报告没有保留可重发内容，新的报告将支持逐条重发。', true);
+    } else if (result.failed) {
+      _showReportRetryFeedback('发送仍然失败，请查看该条报告的错误信息。', true);
+    } else {
+      _showReportRetryFeedback('邮件服务器已接受这份报告；请检查收件箱和垃圾邮件。', false);
+    }
+  }).catch(function() {
+    _showReportRetryFeedback('重发请求失败，请确认程序仍在运行后重试。', true);
+  }).finally(function() {
+    _reportRetryingId = null;
+    _pollQueue();
+  });
+});
+document.getElementById('reportDeliveryPagination').addEventListener('click', function(event) {
+  var button = event.target.closest('[data-report-page]');
+  if (!button || button.disabled) return;
+  _reportPage = Math.max(1, Number(button.getAttribute('data-report-page')) || 1);
+  _pollQueue();
+});
 /* Drag-to-scroll for queue list */
 (function() {
   var el = document.getElementById('qList');
@@ -312,9 +770,11 @@ function _renderQueue() {
   el.addEventListener('mousemove', function(e) { if (!isDown) return; e.preventDefault(); el.scrollLeft = scrollL - (e.pageX - el.offsetLeft - startX); });
 })();
 function _pollQueue() {
-  fetch('/api/queue-status').then(function(r) { return r.json(); }).then(function(d) {
+  fetch('/api/queue-status?report_page=' + encodeURIComponent(_reportPage)).then(function(r) { return r.json(); }).then(function(d) {
     _qData = d.items || [];
     _renderQueue();
+    _updateIssueRows();
+    _renderReportDelivery(d.report_delivery);
   }).catch(function() {});
 }
 _pollQueue();
@@ -338,7 +798,7 @@ function checkNetwork() {
   var originalText = btn.innerHTML;
   btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="15" height="15" style="animation:spin 1s linear infinite"><circle cx="12" cy="12" r="10"/></svg> 检测中...';
   btn.disabled = true;
-  
+
   fetch('/api/network-check')
     .then(function(r) { return r.json(); })
     .then(function(data) {

@@ -1,10 +1,11 @@
 import datetime
-import queue
 import tempfile
 import unittest
+from email.mime.text import MIMEText
 from pathlib import Path
 from unittest.mock import patch
 
+import scheduler_notifications
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -14,124 +15,12 @@ from models import MonitorTask, ProductItem, SystemConfig
 
 
 class SchedulerTests(unittest.TestCase):
-    def test_schedule_digest_flush_replaces_existing_timer_and_flushes_once(self):
-        class FakeTimer:
-            instances = []
-
-            def __init__(self, interval, function, args=None, kwargs=None):
-                self.interval = interval
-                self.function = function
-                self.args = args or ()
-                self.kwargs = kwargs or {}
-                self.started = False
-                self.cancelled = False
-                self.daemon = False
-                self.name = None
-                FakeTimer.instances.append(self)
-
-            def start(self):
-                self.started = True
-
-            def cancel(self):
-                self.cancelled = True
-
-        original_timer = scheduler._digest_flush_timer
-        try:
-            FakeTimer.instances = []
-            scheduler._digest_flush_timer = None
-
-            with patch("scheduler.threading.Timer", FakeTimer), \
-                 patch("scheduler._flush_digest") as flush_mock:
-                scheduler._schedule_digest_flush(delay_seconds=12)
-                first_timer = FakeTimer.instances[-1]
-                self.assertTrue(first_timer.started)
-                self.assertEqual(first_timer.interval, 12)
-                self.assertTrue(first_timer.daemon)
-                self.assertEqual(first_timer.name, "digest-flush-timer")
-
-                scheduler._schedule_digest_flush(delay_seconds=6)
-                second_timer = FakeTimer.instances[-1]
-                self.assertTrue(first_timer.cancelled)
-                self.assertTrue(second_timer.started)
-                self.assertEqual(second_timer.interval, 6)
-
-                second_timer.function(*second_timer.args, **second_timer.kwargs)
-                self.assertIsNone(scheduler._digest_flush_timer)
-                flush_mock.assert_called_once()
-        finally:
-            scheduler._digest_flush_timer = original_timer
-
-    def test_queue_monitor_task_cancels_pending_digest_flush(self):
-        class PendingTimer:
-            def __init__(self):
-                self.cancelled = False
-
-            def cancel(self):
-                self.cancelled = True
-
-        original_timer = scheduler._digest_flush_timer
-        original_queue = scheduler._execution_queue
-        original_inflight = scheduler._inflight_task_ids
-        original_queued = scheduler._queued_task_ids
-
-        try:
-            pending_timer = PendingTimer()
-            scheduler._digest_flush_timer = pending_timer
-            scheduler._execution_queue = queue.Queue()
-            scheduler._inflight_task_ids = set()
-            scheduler._queued_task_ids = []
-
-            queued = scheduler.queue_monitor_task(42)
-
-            self.assertTrue(queued)
-            self.assertTrue(pending_timer.cancelled)
-            self.assertIsNone(scheduler._digest_flush_timer)
-            self.assertEqual(scheduler._queued_task_ids, [42])
-            self.assertEqual(scheduler._execution_queue.get_nowait(), 42)
-        finally:
-            scheduler._digest_flush_timer = original_timer
-            scheduler._execution_queue = original_queue
-            scheduler._inflight_task_ids = original_inflight
-            scheduler._queued_task_ids = original_queued
-
-    def test_execute_monitor_task_cancels_pending_digest_flush(self):
-        class PendingTimer:
-            def __init__(self):
-                self.cancelled = False
-
-            def cancel(self):
-                self.cancelled = True
-
-        original_timer = scheduler._digest_flush_timer
-        original_queue = scheduler._execution_queue
-        original_inflight = scheduler._inflight_task_ids
-        original_queued = scheduler._queued_task_ids
-
-        try:
-            pending_timer = PendingTimer()
-            scheduler._digest_flush_timer = pending_timer
-            scheduler._execution_queue = queue.Queue()
-            scheduler._inflight_task_ids = set()
-            scheduler._queued_task_ids = []
-
-            scheduler.execute_monitor_task(84)
-
-            self.assertTrue(pending_timer.cancelled)
-            self.assertIsNone(scheduler._digest_flush_timer)
-            self.assertEqual(scheduler._queued_task_ids, [84])
-            self.assertEqual(scheduler._execution_queue.get_nowait(), 84)
-        finally:
-            scheduler._digest_flush_timer = original_timer
-            scheduler._execution_queue = original_queue
-            scheduler._inflight_task_ids = original_inflight
-            scheduler._queued_task_ids = original_queued
-
     def test_parse_recipients_filters_invalid_and_deduplicates(self):
         raw = "a@test.com,invalid-email,a@test.com,b@test.com,\r\nbad@test.com"
         actual = scheduler._parse_recipients(raw)
         self.assertEqual(actual, ["a@test.com", "b@test.com"])
 
-    def test_prune_removed_products_history_only_deletes_expired_removed_rows(self):
+    def test_smtp_failover_uses_qq_first_then_gmail_fallback(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             db_file = Path(tmp_dir) / "test_monitor.db"
             engine = create_engine(
@@ -141,64 +30,57 @@ class SchedulerTests(unittest.TestCase):
             TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
             Base.metadata.create_all(bind=engine)
 
-            now = datetime.datetime.now(datetime.timezone.utc)
             with TestingSessionLocal() as db:
-                db.add(SystemConfig(product_retention_days=30))
-                task = MonitorTask(
-                    name="demo",
-                    url="https://example.com",
-                    selector="div.item",
-                    check_interval_hours=24,
-                    recipients="a@test.com",
-                    is_active=True,
-                )
-                db.add(task)
-                db.flush()
-                db.add_all(
-                    [
-                        ProductItem(
-                            task_id=task.id,
-                            product_link="https://example.com/p-removed-old",
-                            name="old removed",
-                            discovered_at=now - datetime.timedelta(days=50),
-                            removed_at=now - datetime.timedelta(days=40),
-                        ),
-                        ProductItem(
-                            task_id=task.id,
-                            product_link="https://example.com/p-removed-fresh",
-                            name="fresh removed",
-                            discovered_at=now - datetime.timedelta(days=15),
-                            removed_at=now - datetime.timedelta(days=10),
-                        ),
-                        ProductItem(
-                            task_id=task.id,
-                            product_link="https://example.com/p-active",
-                            name="active",
-                            discovered_at=now - datetime.timedelta(days=120),
-                            removed_at=None,
-                        ),
-                    ]
+                db.add(
+                    SystemConfig(
+                        smtp_server="smtp.qq.com",
+                        smtp_port=465,
+                        sender_email="primary@qq.com",
+                        sender_password="enc::primary",
+                        backup_smtp_enabled=True,
+                        backup_smtp_server="smtp.gmail.com",
+                        backup_smtp_port=587,
+                        backup_sender_email="backup@gmail.com",
+                        backup_sender_password="enc::backup",
+                    )
                 )
                 db.commit()
 
-            original_session_local = scheduler.SessionLocal
-            try:
-                scheduler.SessionLocal = TestingSessionLocal
-                scheduler.prune_removed_products_history()
-            finally:
-                scheduler.SessionLocal = original_session_local
+                attempts = []
 
-            try:
-                with TestingSessionLocal() as db:
-                    links = {item.product_link for item in db.query(ProductItem).all()}
+                def _fake_smtp_send(config, smtp_password, msg, recipients, retry_attempts=2):
+                    attempts.append((config.smtp_server, smtp_password, msg["From"], list(recipients)))
+                    if config.smtp_server == "smtp.qq.com":
+                        raise TimeoutError("qq network timeout")
 
-                self.assertNotIn("https://example.com/p-removed-old", links)
-                self.assertIn("https://example.com/p-removed-fresh", links)
-                self.assertIn("https://example.com/p-active", links)
-            finally:
-                engine.dispose()
+                msg = MIMEText("body", "plain", "utf-8")
+                msg["Subject"] = "test"
+                msg["From"] = "placeholder@example.com"
+                msg["To"] = "ops@example.com"
 
-    def test_first_successful_run_sends_initial_digest_email(self):
+                with patch("scheduler_notifications.decrypt_secret", side_effect=lambda value: value.replace("enc::", "")), \
+                     patch("scheduler_notifications.smtp_send", side_effect=_fake_smtp_send):
+                    ok = scheduler_notifications.send_with_smtp_failover(
+                        db,
+                        msg,
+                        ["ops@example.com"],
+                        retry_attempts=0,
+                        purpose="unit-test",
+                    )
+
+                self.assertTrue(ok)
+                self.assertEqual(
+                    attempts,
+                    [
+                        ("smtp.qq.com", "primary", "primary@qq.com", ["ops@example.com"]),
+                        ("smtp.gmail.com", "backup", "backup@gmail.com", ["ops@example.com"]),
+                    ],
+                )
+                self.assertEqual(msg["From"], "backup@gmail.com")
+
+            engine.dispose()
+
+    def test_first_successful_run_queues_manual_report_with_all_current_products(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             db_file = Path(tmp_dir) / "test_monitor.db"
             engine = create_engine(
@@ -240,16 +122,18 @@ class SchedulerTests(unittest.TestCase):
                              [],
                          ),
                      ), \
-                     patch("scheduler.send_email") as send_email_mock:
+                     patch("scheduler._notifications.send_consolidated_email", return_value=True) as send_report_mock:
                     scheduler._execute_monitor_task_locked(task_id)
-                    self.assertTrue(send_email_mock.called)
-                    args = send_email_mock.call_args.args
-                    self.assertEqual(len(args[2]), 1)  # new_products payload for initial digest
+                    send_report_mock.assert_called_once()
+                    entries = send_report_mock.call_args.args[1]
+                    self.assertEqual(len(entries), 1)
+                    self.assertTrue(entries[0]["is_baseline"])
+                    self.assertEqual(entries[0]["current_products"][0]["link"], "https://example.com/p1")
             finally:
                 scheduler.SessionLocal = original_session_local
                 engine.dispose()
 
-    def test_transient_scrape_failure_is_requeued_without_health_penalty(self):
+    def test_transient_scrape_failure_requires_manual_review(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             db_file = Path(tmp_dir) / "test_monitor.db"
             engine = create_engine(
@@ -278,8 +162,6 @@ class SchedulerTests(unittest.TestCase):
             try:
                 scheduler.SessionLocal = TestingSessionLocal
                 with patch("scheduler.validate_monitor_target_url", return_value="https://example.com"), \
-                     patch("scheduler._TASK_RETRY_ATTEMPTS", 0), \
-                     patch("scheduler.time.sleep"), \
                      patch("scheduler.add_to_retry_queue") as retry_queue_mock, \
                      patch(
                          "scheduler.fetch_products_for_task",
@@ -290,14 +172,65 @@ class SchedulerTests(unittest.TestCase):
                 with TestingSessionLocal() as db:
                     task = db.query(MonitorTask).filter(MonitorTask.id == task_id).first()
                     self.assertEqual(task.consecutive_empty_count, 0)
-                    self.assertEqual(task.health_state, "healthy")
+                    self.assertEqual(task.consecutive_failure_count, 1)
+                    self.assertEqual(task.health_state, "warning")
+                    self.assertTrue(task.manual_review_pending)
+                    self.assertEqual(task.manual_review_kind, "failure")
+                    self.assertIn("captcha", task.last_failure_reason)
 
-                retry_queue_mock.assert_called_once_with(task_id)
+                retry_queue_mock.assert_not_called()
             finally:
                 scheduler.SessionLocal = original_session_local
                 engine.dispose()
 
-    def test_network_retry_status_popup_event_is_throttled_until_recovery(self):
+    def test_pending_manual_review_scopes_excludes_inactive_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_file = Path(tmp_dir) / "test_monitor.db"
+            engine = create_engine(
+                f"sqlite:///{db_file.as_posix()}",
+                connect_args={"check_same_thread": False},
+            )
+            TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+            Base.metadata.create_all(bind=engine)
+
+            with TestingSessionLocal() as db:
+                db.add_all(
+                    [
+                        MonitorTask(
+                            name="active-manual",
+                            url="https://example.com/active-manual",
+                            selector="div.item",
+                            check_interval_hours=24,
+                            recipients="a@test.com",
+                            is_active=True,
+                            manual_review_pending=True,
+                            manual_review_scope_key="group:active",
+                        ),
+                        MonitorTask(
+                            name="inactive-manual",
+                            url="https://example.com/inactive-manual",
+                            selector="div.item",
+                            check_interval_hours=24,
+                            recipients="b@test.com",
+                            is_active=False,
+                            manual_review_pending=True,
+                            manual_review_scope_key="group:inactive",
+                        ),
+                    ]
+                )
+                db.commit()
+
+            original_session_local = scheduler.SessionLocal
+            try:
+                scheduler.SessionLocal = TestingSessionLocal
+                scopes = scheduler._pending_manual_review_scopes()
+            finally:
+                scheduler.SessionLocal = original_session_local
+                engine.dispose()
+
+            self.assertEqual(scopes, {"group:active"})
+
+    def test_network_retry_status_popup_event_reports_manual_follow_up_after_recovery(self):
         original_queue = scheduler._network_retry_queue
         original_healthy = scheduler._network_healthy
         original_last_check = scheduler._last_network_check
@@ -333,17 +266,25 @@ class SchedulerTests(unittest.TestCase):
                 self.assertEqual(second_status["alert_event_id"], 1)
                 self.assertEqual(second_status["pending_count"], 2)
 
-            with patch("scheduler._check_network_health", return_value=True), \
+            with patch(
+                "scheduler.run_network_diagnostics",
+                return_value={
+                    "success": True,
+                    "message": "ok",
+                    "response_time_ms": 123,
+                    "details": [],
+                },
+            ), \
                  patch("scheduler.queue_monitor_task") as requeue_mock:
                 scheduler._network_check_and_retry()
 
             recovered_status = scheduler.get_network_retry_status()
             self.assertFalse(recovered_status["alert_active"])
-            self.assertEqual(recovered_status["pending_count"], 0)
+            self.assertEqual(recovered_status["pending_count"], 2)
             self.assertTrue(recovered_status["network_healthy"])
             self.assertEqual(recovered_status["recovery_event_id"], 1)
-            self.assertIn("自动重试", recovered_status["last_recovery_message"])
-            self.assertEqual(requeue_mock.call_count, 2)
+            self.assertIn("人工重试", recovered_status["last_recovery_message"])
+            self.assertEqual(requeue_mock.call_count, 0)
 
             with patch("scheduler._ensure_network_check_scheduled"):
                 scheduler.add_to_retry_queue(303)
@@ -361,6 +302,435 @@ class SchedulerTests(unittest.TestCase):
             scheduler._network_recovery_event_id = original_recovery_event_id
             scheduler._last_network_recovery_at = original_recovery_at
             scheduler._last_network_recovery_message = original_recovery_message
+
+    def test_manual_network_check_keeps_pending_tasks_for_manual_retry(self):
+        original_queue = scheduler._network_retry_queue
+        original_healthy = scheduler._network_healthy
+        original_last_check = scheduler._last_network_check
+        original_issue_active = scheduler._network_issue_active
+
+        try:
+            scheduler._network_retry_queue = [11, 22]
+            scheduler._network_healthy = False
+            scheduler._last_network_check = None
+            scheduler._network_issue_active = True
+
+            with patch(
+                "scheduler.run_network_diagnostics",
+                return_value={
+                    "success": True,
+                    "message": "✅ 网络状态良好！平均响应 200ms，适合抓取。",
+                    "response_time_ms": 200,
+                    "details": [],
+                },
+            ), patch("scheduler.queue_monitor_task") as queue_mock:
+                payload = scheduler.run_manual_network_check()
+
+            self.assertTrue(payload["success"])
+            self.assertIn("待人工处理任务", payload["message"])
+            self.assertEqual(scheduler.get_retry_queue_snapshot(), [11, 22])
+            self.assertEqual(queue_mock.call_count, 0)
+        finally:
+            scheduler._network_retry_queue = original_queue
+            scheduler._network_healthy = original_healthy
+            scheduler._last_network_check = original_last_check
+            scheduler._network_issue_active = original_issue_active
+
+    def test_schedule_task_skips_auto_scheduling_when_manual_review_pending(self):
+        task = MonitorTask(
+            id=321,
+            name="pending-review-task",
+            url="https://example.com",
+            selector="div.item",
+            check_interval_hours=24,
+            recipients="a@test.com",
+            is_active=True,
+            manual_review_pending=True,
+        )
+
+        with patch.object(scheduler.scheduler, "get_job", return_value=None), \
+             patch.object(scheduler.scheduler, "remove_job") as remove_job_mock, \
+             patch.object(scheduler.scheduler, "add_job") as add_job_mock:
+            scheduler.schedule_task(task)
+
+        remove_job_mock.assert_not_called()
+        add_job_mock.assert_not_called()
+
+    def test_daily_status_report_updates_last_sent_on_success(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_file = Path(tmp_dir) / "test_monitor.db"
+            engine = create_engine(
+                f"sqlite:///{db_file.as_posix()}",
+                connect_args={"check_same_thread": False},
+            )
+            TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+            Base.metadata.create_all(bind=engine)
+
+            with TestingSessionLocal() as db:
+                db.add(
+                    SystemConfig(
+                        sender_email="sender@example.com",
+                        sender_password="enc::dummy",
+                    )
+                )
+                db.add(
+                    MonitorTask(
+                        name="daily-demo",
+                        url="https://example.com",
+                        selector="div.item",
+                        check_interval_hours=24,
+                        recipients="a@test.com",
+                        is_active=True,
+                    )
+                )
+                db.commit()
+
+            original_session_local = scheduler.SessionLocal
+            try:
+                scheduler.SessionLocal = TestingSessionLocal
+                with patch("scheduler._send_daily_status_email", return_value=True):
+                    scheduler.send_daily_status_report()
+
+                with TestingSessionLocal() as db:
+                    config = db.query(SystemConfig).first()
+                    self.assertIsNotNone(config.last_daily_report_at)
+            finally:
+                scheduler.SessionLocal = original_session_local
+                engine.dispose()
+
+    def test_daily_status_report_skip_uses_local_report_date(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_file = Path(tmp_dir) / "test_monitor.db"
+            engine = create_engine(
+                f"sqlite:///{db_file.as_posix()}",
+                connect_args={"check_same_thread": False},
+            )
+            TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+            Base.metadata.create_all(bind=engine)
+
+            with TestingSessionLocal() as db:
+                db.add(
+                    SystemConfig(
+                        sender_email="sender@example.com",
+                        sender_password="enc::dummy",
+                        last_daily_report_at=datetime.datetime(2026, 4, 1, 16, 30),
+                    )
+                )
+                db.add(
+                    MonitorTask(
+                        name="daily-demo",
+                        url="https://example.com",
+                        selector="div.item",
+                        check_interval_hours=24,
+                        recipients="a@test.com",
+                        is_active=True,
+                    )
+                )
+                db.commit()
+
+            original_session_local = scheduler.SessionLocal
+            try:
+                scheduler.SessionLocal = TestingSessionLocal
+                with patch("scheduler._send_daily_status_email") as send_mock:
+                    scheduler.send_daily_status_report(
+                        now=datetime.datetime(2026, 4, 2, 1, 0, tzinfo=datetime.timezone.utc)
+                    )
+                send_mock.assert_not_called()
+            finally:
+                scheduler.SessionLocal = original_session_local
+                engine.dispose()
+
+    def test_daily_status_report_if_due_catches_missed_cron_after_report_time(self):
+        with patch("scheduler.send_daily_status_report") as send_mock:
+            scheduler.send_daily_status_report_if_due(
+                now=datetime.datetime(2026, 4, 2, 2, 0, tzinfo=datetime.timezone.utc)
+            )
+        send_mock.assert_called_once()
+
+    def test_daily_status_report_if_due_waits_before_report_time(self):
+        with patch("scheduler.send_daily_status_report") as send_mock:
+            scheduler.send_daily_status_report_if_due(
+                now=datetime.datetime(2026, 4, 2, 0, 30, tzinfo=datetime.timezone.utc)
+            )
+        send_mock.assert_not_called()
+
+    def test_daily_new_product_payload_uses_today_new_discoveries_only(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_file = Path(tmp_dir) / "test_monitor.db"
+            engine = create_engine(
+                f"sqlite:///{db_file.as_posix()}",
+                connect_args={"check_same_thread": False},
+            )
+            TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+            Base.metadata.create_all(bind=engine)
+
+            with TestingSessionLocal() as db:
+                task = MonitorTask(
+                    name="daily-products",
+                    url="https://example.com",
+                    selector="div.item",
+                    check_interval_hours=24,
+                    recipients="a@test.com",
+                    is_active=True,
+                )
+                db.add(task)
+                db.commit()
+                db.refresh(task)
+
+                db.add_all(
+                    [
+                        ProductItem(
+                            task_id=task.id,
+                            product_link="https://example.com/today-new",
+                            name="Today New",
+                            discovered_at=datetime.datetime(2026, 4, 1, 1, 30),
+                            is_new_discovery=True,
+                        ),
+                        ProductItem(
+                            task_id=task.id,
+                            product_link="https://example.com/today-baseline",
+                            name="Today Baseline",
+                            discovered_at=datetime.datetime(2026, 4, 1, 1, 45),
+                            is_new_discovery=False,
+                        ),
+                        ProductItem(
+                            task_id=task.id,
+                            product_link="https://example.com/yesterday-new",
+                            name="Yesterday New",
+                            discovered_at=datetime.datetime(2026, 3, 31, 1, 30),
+                            is_new_discovery=True,
+                        ),
+                    ]
+                )
+                db.commit()
+
+                products, report_date = scheduler._daily_new_product_payload(
+                    db,
+                    datetime.datetime(2026, 4, 1, 9, 0, tzinfo=datetime.timezone.utc),
+                )
+
+            self.assertEqual(report_date, "2026-04-01")
+            self.assertEqual([item["name"] for item in products], ["Today New"])
+            engine.dispose()
+
+    def test_legacy_scheduled_scope_no_longer_suppresses_manual_report(self):
+        task = MonitorTask(id=123, name="scheduled-demo", category_id=None)
+        try:
+            scheduler._set_execution_context(123, scheduler._scheduled_digest_scope())
+            with patch("scheduler._notifications.queue_digest_entry") as queue_mock:
+                scheduler._queue_digest_entry(
+                    task,
+                    [{"name": "New Product", "link": "https://example.com/new"}],
+                    [],
+                )
+            queue_mock.assert_called_once()
+        finally:
+            scheduler._clear_execution_context()
+
+    def test_daily_status_email_omits_failed_task_details(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_file = Path(tmp_dir) / "test_monitor.db"
+            engine = create_engine(
+                f"sqlite:///{db_file.as_posix()}",
+                connect_args={"check_same_thread": False},
+            )
+            TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+            Base.metadata.create_all(bind=engine)
+
+            with TestingSessionLocal() as db:
+                db.add(
+                    SystemConfig(
+                        smtp_server="smtp.example.com",
+                        smtp_port=465,
+                        sender_email="sender@example.com",
+                        sender_password="enc::dummy",
+                    )
+                )
+                task = MonitorTask(
+                    name="mail-demo",
+                    url="https://example.com",
+                    selector="div.item",
+                    check_interval_hours=24,
+                    recipients="a@test.com",
+                    is_active=True,
+                )
+                db.add(task)
+                db.commit()
+
+                sent = {}
+
+                def _fake_smtp_send(config, smtp_password, msg, recipients, retry_attempts=2):
+                    sent["msg"] = msg
+                    sent["recipients"] = recipients
+
+                with patch("scheduler_notifications.decrypt_secret", return_value="secret"), \
+                     patch("scheduler_notifications.smtp_send", side_effect=_fake_smtp_send):
+                    ok = scheduler_notifications.send_daily_status_email(
+                        db,
+                        {
+                            "generated_at": datetime.datetime(2026, 4, 1, 9, 0, tzinfo=datetime.timezone.utc),
+                            "active_task_count": 1,
+                            "retry_pending_count": 0,
+                            "running_task_name": "",
+                            "waiting_count": 0,
+                            "abnormal_tasks": [],
+                            "failed_tasks": [
+                                {
+                                    "task_id": task.id,
+                                    "task_name": "Should Not Appear",
+                                    "group_name": "Test Group",
+                                    "status_text": "失败 5 次",
+                                    "reason": "抓取结果为空",
+                                    "updated_at": "2026-04-01 09:00",
+                                }
+                            ],
+                        },
+                    )
+
+                self.assertTrue(ok)
+                body = sent["msg"].get_payload(decode=True).decode("utf-8")
+                self.assertIn("当前共有 <b>1</b> 个失败任务", body)
+                self.assertIn("失败任务不会写入邮件详情", body)
+                self.assertIn("今日暂未发现新品。", body)
+                self.assertNotIn("Should Not Appear", body)
+            engine.dispose()
+
+    def test_daily_status_email_formats_abnormal_task_datetime(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_file = Path(tmp_dir) / "test_monitor.db"
+            engine = create_engine(
+                f"sqlite:///{db_file.as_posix()}",
+                connect_args={"check_same_thread": False},
+            )
+            TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+            Base.metadata.create_all(bind=engine)
+
+            with TestingSessionLocal() as db:
+                db.add(
+                    SystemConfig(
+                        smtp_server="smtp.example.com",
+                        smtp_port=465,
+                        sender_email="sender@example.com",
+                        sender_password="enc::dummy",
+                    )
+                )
+                db.add(
+                    MonitorTask(
+                        name="daily-mail-demo",
+                        url="https://example.com",
+                        selector="div.item",
+                        check_interval_hours=24,
+                        recipients="a@test.com",
+                        is_active=True,
+                    )
+                )
+                db.commit()
+
+                sent = {}
+
+                def _fake_smtp_send(config, smtp_password, msg, recipients, retry_attempts=2):
+                    sent["msg"] = msg
+
+                with patch("scheduler_notifications.decrypt_secret", return_value="secret"), \
+                     patch("scheduler_notifications.smtp_send", side_effect=_fake_smtp_send):
+                    ok = scheduler_notifications.send_daily_status_email(
+                        db,
+                        {
+                            "generated_at": datetime.datetime(2026, 4, 1, 1, 0, tzinfo=datetime.timezone.utc),
+                            "report_date_text": "2026-04-01",
+                            "active_task_count": 1,
+                            "retry_pending_count": 0,
+                            "running_task_name": "",
+                            "waiting_count": 0,
+                            "abnormal_tasks": [
+                                {
+                                    "task_id": 1,
+                                    "task_name": "Warning Task",
+                                    "group_name": "Test Group",
+                                    "status_text": "异常",
+                                    "reason": "连续为空",
+                                    "updated_at": datetime.datetime(2026, 4, 1, 1, 0, tzinfo=datetime.timezone.utc),
+                                }
+                            ],
+                            "failed_tasks": [],
+                            "new_products": [],
+                        },
+                    )
+
+                self.assertTrue(ok)
+                body = sent["msg"].get_payload(decode=True).decode("utf-8")
+                self.assertIn("Warning Task", body)
+                self.assertIn("2026-04-01 09:00", body)
+            engine.dispose()
+
+    def test_daily_status_email_lists_new_products(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_file = Path(tmp_dir) / "test_monitor.db"
+            engine = create_engine(
+                f"sqlite:///{db_file.as_posix()}",
+                connect_args={"check_same_thread": False},
+            )
+            TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+            Base.metadata.create_all(bind=engine)
+
+            with TestingSessionLocal() as db:
+                db.add(
+                    SystemConfig(
+                        smtp_server="smtp.example.com",
+                        smtp_port=465,
+                        sender_email="sender@example.com",
+                        sender_password="enc::dummy",
+                    )
+                )
+                db.add(
+                    MonitorTask(
+                        name="daily-mail-demo",
+                        url="https://example.com",
+                        selector="div.item",
+                        check_interval_hours=24,
+                        recipients="a@test.com",
+                        is_active=True,
+                    )
+                )
+                db.commit()
+
+                sent = {}
+
+                def _fake_smtp_send(config, smtp_password, msg, recipients, retry_attempts=2):
+                    sent["msg"] = msg
+
+                with patch("scheduler_notifications.decrypt_secret", return_value="secret"), \
+                     patch("scheduler_notifications.smtp_send", side_effect=_fake_smtp_send):
+                    ok = scheduler_notifications.send_daily_status_email(
+                        db,
+                        {
+                            "generated_at": datetime.datetime(2026, 4, 1, 9, 0, tzinfo=datetime.timezone.utc),
+                            "report_date_text": "2026-04-01",
+                            "active_task_count": 1,
+                            "retry_pending_count": 0,
+                            "running_task_name": "",
+                            "waiting_count": 0,
+                            "abnormal_tasks": [],
+                            "failed_tasks": [],
+                            "new_products": [
+                                {
+                                    "name": "Launch Product",
+                                    "link": "https://example.com/products/launch",
+                                    "task_name": "daily-mail-demo",
+                                    "group_name": "Test Group",
+                                    "discovered_text": "04-01 17:30",
+                                }
+                            ],
+                        },
+                    )
+
+                self.assertTrue(ok)
+                body = sent["msg"].get_payload(decode=True).decode("utf-8")
+                self.assertIn("今日新上架商品 (1)", body)
+                self.assertIn("Launch Product", body)
+                self.assertIn("daily-mail-demo", body)
+                self.assertNotIn("今日暂未发现新品。", body)
+            engine.dispose()
 
 
 if __name__ == "__main__":

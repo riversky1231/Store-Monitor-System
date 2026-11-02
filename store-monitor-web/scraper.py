@@ -5,6 +5,7 @@ import hashlib
 import html
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -26,7 +27,9 @@ from urllib.parse import (
 
 from sqlalchemy.orm import Session
 
-from models import MonitorTask, ProductItem
+from models import MonitorTask, ProductItem, SeenProduct
+from security import validate_monitor_target_url
+from traffic_metrics import TrafficCapture, finish_capture as finish_traffic_capture, start_capture as start_traffic_capture
 from utils import get_runtime_data_path
 
 if TYPE_CHECKING:  # only for type checkers; not imported at runtime
@@ -43,7 +46,7 @@ _INTEGRITY_MIN_REFERENCE_COUNT = max(1, int(os.getenv("MONITOR_WEB_INTEGRITY_MIN
 _REMOVAL_MISS_THRESHOLD = max(1, int(os.getenv("MONITOR_WEB_REMOVAL_MISS_THRESHOLD", "2") or "2"))
 _INTEGRITY_RATIO_SMALL = min(0.98, max(0.55, float(os.getenv("MONITOR_WEB_INTEGRITY_RATIO_SMALL", "0.75") or "0.75")))
 _INTEGRITY_RATIO_MEDIUM = min(0.98, max(0.55, float(os.getenv("MONITOR_WEB_INTEGRITY_RATIO_MEDIUM", "0.85") or "0.85")))
-_INTEGRITY_RATIO_LARGE = min(0.99, max(0.6, float(os.getenv("MONITOR_WEB_INTEGRITY_RATIO_LARGE", "0.90") or "0.90")))
+_INTEGRITY_RATIO_LARGE = min(0.99, max(0.6, float(os.getenv("MONITOR_WEB_INTEGRITY_RATIO_LARGE", "0.70") or "0.70")))
 _RESULT_WAIT_TIMEOUT_MS = max(5000, int(os.getenv("MONITOR_WEB_RESULT_WAIT_MS", "25000") or "25000"))
 _EMPTY_PAGE_RECOVERY_ATTEMPTS = max(
     1, int(os.getenv("MONITOR_WEB_EMPTY_PAGE_RECOVERY_ATTEMPTS", "2") or "2")
@@ -122,6 +125,9 @@ _OVERLAY_DISMISS_SELECTORS = (
     "input[name='accept']",
     "button:has-text('Accept Cookies')",
     "button:has-text('Accept')",
+)
+_INTEGRITY_REVIEW_STATE_TTL_HOURS = max(
+    1, int(os.getenv("MONITOR_WEB_INTEGRITY_REVIEW_TTL_HOURS", "72") or "72")
 )
 _LD_LIBRARY_PATH_SEP = ":"
 
@@ -241,6 +247,119 @@ def _save_catalog_shift_state(task_id: int, identity_keys: Set[str]) -> None:
         logger.debug("Failed to persist catalog shift state %s: %s", path, exc)
 
 
+def _integrity_review_state_dir() -> Path:
+    state_dir = _runtime_base_dir() / "integrity-review-state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return state_dir
+
+
+def _integrity_review_state_path(task_id: int) -> Path:
+    return _integrity_review_state_dir() / f"task-{task_id}.json"
+
+
+def clear_pending_integrity_review(task_id: int) -> None:
+    path = _integrity_review_state_path(task_id)
+    if not path.exists():
+        return
+    try:
+        path.unlink()
+    except OSError as exc:
+        logger.debug("Failed to delete integrity review state %s: %s", path, exc)
+
+
+def _load_integrity_review_state(task_id: int) -> Dict[str, object] | None:
+    path = _integrity_review_state_path(task_id)
+    if not path.exists():
+        return None
+    max_age = _INTEGRITY_REVIEW_STATE_TTL_HOURS * 3600
+    age_seconds = time.time() - path.stat().st_mtime
+    if age_seconds > max_age:
+        clear_pending_integrity_review(task_id)
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception as exc:
+        logger.debug("Failed to load integrity review state %s: %s", path, exc)
+        clear_pending_integrity_review(task_id)
+        return None
+    if not isinstance(payload, dict):
+        clear_pending_integrity_review(task_id)
+        return None
+    return payload
+
+
+def _sanitize_review_products(products: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    sanitized: List[Dict[str, str]] = []
+    for item in products:
+        if not isinstance(item, dict):
+            continue
+        name = (item.get("name") or "").strip()
+        link = (item.get("link") or "").strip()
+        asin = (item.get("asin") or "").strip().upper()
+        if not name or not link or _is_noise_title(name):
+            continue
+        sanitized.append({"name": name, "link": link, "asin": asin})
+    return _dedupe_scraped_products(sanitized)
+
+
+def _save_integrity_review_state(
+    task_id: int,
+    current_products: List[Dict[str, str]],
+    *,
+    reference_count: int,
+    integrity_ratio: float,
+    scrape_ratio: float,
+    allowed_shortfall: int,
+    min_required_count: int,
+    ratio_required_count: int,
+    count_required_floor: int,
+) -> None:
+    path = _integrity_review_state_path(task_id)
+    payload = {
+        "captured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "current_count": len(current_products),
+        "reference_count": int(reference_count),
+        "integrity_ratio": float(integrity_ratio),
+        "scrape_ratio": float(scrape_ratio),
+        "allowed_shortfall": int(allowed_shortfall),
+        "min_required_count": int(min_required_count),
+        "ratio_required_count": int(ratio_required_count),
+        "count_required_floor": int(count_required_floor),
+        "products": current_products,
+    }
+    try:
+        with path.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=True, sort_keys=True)
+    except Exception as exc:
+        logger.debug("Failed to persist integrity review state %s: %s", path, exc)
+
+
+def get_pending_integrity_review(task_id: int) -> Dict[str, object] | None:
+    payload = _load_integrity_review_state(task_id)
+    if not payload:
+        return None
+    current_count = int(payload.get("current_count") or 0)
+    reference_count = int(payload.get("reference_count") or 0)
+    min_required_count = int(payload.get("min_required_count") or 0)
+    allowed_shortfall = int(payload.get("allowed_shortfall") or 0)
+    scrape_ratio = float(payload.get("scrape_ratio") or 0.0)
+    integrity_ratio = float(payload.get("integrity_ratio") or 0.0)
+    return {
+        "captured_at": payload.get("captured_at"),
+        "current_count": current_count,
+        "reference_count": reference_count,
+        "min_required_count": min_required_count,
+        "allowed_shortfall": allowed_shortfall,
+        "scrape_ratio": scrape_ratio,
+        "integrity_ratio": integrity_ratio,
+        "summary": (
+            f"当前抓到 {current_count} 个，可信基准 {reference_count} 个；"
+            f"联合阈值至少 {min_required_count} 个，可容忍缺失 {allowed_shortfall} 个。"
+        ),
+    }
+
+
 def _product_identity_key(asin: str | None, link: str | None) -> str:
     asin_value = (asin or "").strip().upper()
     if asin_value:
@@ -316,11 +435,14 @@ def _pending_catalog_shift_confirmation(
 
 
 class _ScrapeRuntime:
-    def __init__(self) -> None:
+    def __init__(self, task: MonitorTask | None = None) -> None:
         self._lock = threading.Lock()
         self._partial_results: List[Dict[str, str]] = []
         self._partial_keys: Set[str] = set()
         self._last_activity_time = time.time()
+        self._traffic_capture: TrafficCapture | None = None
+        if task is not None:
+            self._traffic_capture = start_traffic_capture(task.id, task.name, task.url)
 
     def touch(self) -> None:
         with self._lock:
@@ -345,6 +467,15 @@ class _ScrapeRuntime:
         with self._lock:
             return time.time() - self._last_activity_time
 
+    def traffic_capture(self) -> TrafficCapture | None:
+        return self._traffic_capture
+
+    def finish_traffic(self, status: str) -> dict | None:
+        with self._lock:
+            capture = self._traffic_capture
+            self._traffic_capture = None
+        return finish_traffic_capture(capture, status)
+
 
 _scrape_runtime_local = threading.local()
 
@@ -360,6 +491,107 @@ def _clear_scrape_runtime() -> None:
 
 def _current_scrape_runtime() -> _ScrapeRuntime | None:
     return getattr(_scrape_runtime_local, "current", None)
+
+
+def _current_traffic_capture() -> TrafficCapture | None:
+    runtime = _current_scrape_runtime()
+    if runtime is None:
+        return None
+    return runtime.traffic_capture()
+
+
+def _header_mapping(obj) -> Dict[str, str]:
+    for attr_name in ("headers", "all_headers"):
+        try:
+            attr = getattr(obj, attr_name)
+        except Exception:
+            continue
+        try:
+            headers = attr() if callable(attr) else attr
+        except Exception:
+            continue
+        if isinstance(headers, dict):
+            return {str(key).lower(): str(value) for key, value in headers.items()}
+    return {}
+
+
+def _request_resource_type(request) -> str:
+    try:
+        resource_type = request.resource_type
+        value = resource_type() if callable(resource_type) else resource_type
+    except Exception:
+        value = ""
+    normalized = (value or "").strip().lower()
+    return normalized or "other"
+
+
+def _request_payload_size(request) -> int:
+    try:
+        payload = request.post_data_buffer
+        value = payload() if callable(payload) else payload
+        if isinstance(value, (bytes, bytearray)):
+            return len(value)
+    except Exception:
+        pass
+
+    try:
+        payload = request.post_data
+        value = payload() if callable(payload) else payload
+        if isinstance(value, str):
+            return len(value.encode("utf-8"))
+    except Exception:
+        pass
+
+    return 0
+
+
+def _response_download_size(response) -> Tuple[int, bool]:
+    headers = _header_mapping(response)
+    content_length = (headers.get("content-length") or "").strip()
+    if content_length.isdigit():
+        return int(content_length), True
+
+    request = getattr(response, "request", None)
+    resource_type = _request_resource_type(request) if request is not None else "other"
+    content_type = (headers.get("content-type") or "").lower()
+    should_probe_body = resource_type in {"document", "stylesheet", "script", "xhr", "fetch", "other"}
+    if not should_probe_body and content_type.startswith(("text/", "application/json", "application/javascript", "application/xml")):
+        should_probe_body = True
+
+    if should_probe_body:
+        try:
+            body = response.body()
+            if isinstance(body, (bytes, bytearray)):
+                return len(body), True
+        except Exception:
+            pass
+
+    return 0, False
+
+
+def _attach_traffic_listeners(page) -> None:
+    capture = _current_traffic_capture()
+    if capture is None:
+        return
+
+    def _on_request(request) -> None:
+        capture.record_request(
+            resource_type=_request_resource_type(request),
+            upload_bytes=_request_payload_size(request),
+        )
+
+    def _on_response(response) -> None:
+        request = getattr(response, "request", None)
+        resource_type = _request_resource_type(request) if request is not None else "other"
+        byte_count, measured = _response_download_size(response)
+        capture.record_response(
+            resource_type=resource_type,
+            download_bytes=byte_count,
+            measured=measured,
+        )
+
+    page.on("request", _on_request)
+    page.on("response", _on_response)
 
 
 def _is_noise_title(title: str | None) -> bool:
@@ -1077,10 +1309,19 @@ def _collect_products_from_page(
 
 
 def _navigate_with_retry(page: Page, url: str, max_attempts: int = 3) -> bool:
+    try:
+        safe_url = validate_monitor_target_url(url, force_dns_refresh=True)
+    except ValueError as exc:
+        logger.warning("Blocked unsafe navigation before request: %s (%s)", url, exc)
+        return False
+
     for attempt in range(1, max_attempts + 1):
         _check_cancel()
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=90000)
+            page.goto(safe_url, wait_until="domcontentloaded", timeout=90000)
+            final_url = (page.url or "").strip()
+            if final_url:
+                validate_monitor_target_url(final_url, force_dns_refresh=True)
             time.sleep(random.uniform(1.0, 2.2))
             _update_activity()  # Mark progress on successful navigation.
             return True
@@ -1088,6 +1329,33 @@ def _navigate_with_retry(page: Page, url: str, max_attempts: int = 3) -> bool:
             logger.warning("Navigate failed attempt %d/%d: %s", attempt, max_attempts, exc)
             time.sleep(2.0 * attempt)
     return False
+
+
+def _install_network_request_guard(context) -> None:
+    """Block browser requests to local/private destinations before they leave Chromium."""
+
+    def _guard(route) -> None:
+        request = route.request
+        request_url = (request.url or "").strip()
+        parsed = urlparse(request_url)
+        if parsed.scheme in {"http", "https"}:
+            try:
+                is_navigation = bool(request.is_navigation_request())
+                validate_monitor_target_url(
+                    request_url,
+                    force_dns_refresh=is_navigation or request.resource_type == "document",
+                )
+            except (ValueError, TypeError) as exc:
+                logger.warning("Blocked unsafe browser request: %s (%s)", request_url, exc)
+                route.abort("blockedbyclient")
+                return
+        elif parsed.scheme not in {"about", "data", "blob"}:
+            logger.warning("Blocked browser request with unsupported scheme: %s", request_url)
+            route.abort("blockedbyclient")
+            return
+        route.continue_()
+
+    context.route("**/*", _guard)
 
 
 def _recover_empty_results_page(
@@ -1217,6 +1485,36 @@ def _required_integrity_ratio(reference_count: int) -> float:
     return _INTEGRITY_RATIO_SMALL
 
 
+def _allowed_integrity_shortfall(reference_count: int) -> int:
+    if reference_count <= 1:
+        return 0
+    return max(1, int(math.sqrt(max(1, reference_count - 1))))
+
+
+def _integrity_thresholds(reference_count: int) -> Dict[str, float | int]:
+    integrity_ratio = _required_integrity_ratio(reference_count)
+    ratio_required_count = max(
+        _MIN_BASELINE_PRODUCTS,
+        int(math.ceil(reference_count * integrity_ratio - 1e-9)),
+    )
+    allowed_shortfall = _allowed_integrity_shortfall(reference_count)
+    count_required_floor = max(
+        _MIN_BASELINE_PRODUCTS,
+        reference_count - allowed_shortfall,
+    )
+    min_required_count = max(
+        _MIN_BASELINE_PRODUCTS,
+        min(ratio_required_count, count_required_floor),
+    )
+    return {
+        "integrity_ratio": integrity_ratio,
+        "ratio_required_count": ratio_required_count,
+        "allowed_shortfall": allowed_shortfall,
+        "count_required_floor": count_required_floor,
+        "min_required_count": min_required_count,
+    }
+
+
 def _dedupe_scraped_products(current_products: List[Dict[str, str]]) -> List[Dict[str, str]]:
     deduped: List[Dict[str, str]] = []
     seen_keys: Set[str] = set()
@@ -1232,6 +1530,83 @@ def _dedupe_scraped_products(current_products: List[Dict[str, str]]) -> List[Dic
         seen_keys.add(key)
         deduped.append({"name": name, "link": link, "asin": asin})
     return deduped
+
+
+def _normalized_asin(value: str | None) -> str:
+    return (value or "").strip().upper()
+
+
+def _known_product_sets(db_products: List[ProductItem]) -> Tuple[Set[str], Set[str]]:
+    known_asins: Set[str] = set()
+    known_links: Set[str] = set()
+    for product in db_products:
+        asin = _normalized_asin(product.asin)
+        if asin:
+            known_asins.add(asin)
+        if product.product_link:
+            known_links.add(product.product_link)
+    return known_asins, known_links
+
+
+def _load_global_product_sets(db: Session) -> Tuple[Set[str], Set[str]]:
+    """Return every ASIN/link the system has EVER seen.
+
+    Combines the permanent seen-products registry (survives task deletion and
+    retention pruning) with live product rows, so a product can only ever be
+    reported as "new" once for the lifetime of the system.
+    """
+    known_asins: Set[str] = set()
+    known_links: Set[str] = set()
+    for asin, product_link in db.query(SeenProduct.asin, SeenProduct.product_link).all():
+        normalized = _normalized_asin(asin)
+        if normalized:
+            known_asins.add(normalized)
+        if product_link:
+            known_links.add(product_link)
+    for asin, product_link in db.query(ProductItem.asin, ProductItem.product_link).all():
+        normalized = _normalized_asin(asin)
+        if normalized:
+            known_asins.add(normalized)
+        if product_link:
+            known_links.add(product_link)
+    return known_asins, known_links
+
+
+def _register_seen_products(db: Session, products: List[Dict[str, str]]) -> None:
+    """Record scraped products in the permanent seen-products registry.
+
+    Uses INSERT OR IGNORE semantics so repeated sightings are no-ops. Rows are
+    never deleted from this table, which is what guarantees the
+    "only ever new once" notification policy.
+    """
+    if not products:
+        return
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    rows = []
+    seen_keys: Set[str] = set()
+    for item in products:
+        asin = _normalized_asin(item.get("asin"))
+        link = (item.get("link") or "").strip()
+        if not asin and not link:
+            continue
+        key = asin or link
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        rows.append(
+            {
+                "asin": asin or None,
+                "product_link": link or None,
+                "name": (item.get("name") or "").strip() or None,
+                "first_seen_at": now,
+            }
+        )
+    if not rows:
+        return
+    stmt = sqlite_insert(SeenProduct).values(rows).on_conflict_do_nothing()
+    db.execute(stmt)
 
 
 class ScrapeIncomplete(Exception):
@@ -1254,7 +1629,7 @@ def _sync_products_to_db(
     4. Peak tracking: remember historical max product count for integrity validation
     
     Returns: (current_products, new_products, removed_products)
-    Raises: ScrapeIncomplete if scrape returned too few products (should retry later)
+    Raises: ScrapeIncomplete if scrape returned too few products and needs manual review
     """
     MISS_THRESHOLD = _REMOVAL_MISS_THRESHOLD
     MIN_PRODUCTS_THRESHOLD = _MIN_BASELINE_PRODUCTS
@@ -1269,6 +1644,8 @@ def _sync_products_to_db(
             logger.error("Task %s not found in database.", task_id)
             return [], [], []
         
+        current_products = _dedupe_scraped_products(current_products)
+        current_products = [item for item in current_products if not _is_noise_title(item.get("name"))]
         current_products = _dedupe_scraped_products(current_products)
         all_db_products = db.query(ProductItem).filter(ProductItem.task_id == task_id).all()
         
@@ -1291,12 +1668,17 @@ def _sync_products_to_db(
                     product_link=item["link"],
                     asin=item.get("asin") or None,
                     name=item["name"],
+                    discovered_at=now,
+                    is_new_discovery=False,
                     miss_count=0,
                 ))
             # Set initial peak
+            task.integrity_reference_count = len(current_products)
             task.peak_product_count = len(current_products)
+            _register_seen_products(db, current_products)
             db.commit()
             _clear_catalog_shift_state(task_id)
+            clear_pending_integrity_review(task_id)
             logger.info(
                 "Task %s baseline initialized with %d products; skip email on first run.",
                 task_id, len(current_products),
@@ -1305,32 +1687,68 @@ def _sync_products_to_db(
         
         # EMPTY SCRAPE: no-op at DB layer; scheduler decides whether to alert/retry.
         if not current_products:
+            clear_pending_integrity_review(task_id)
             logger.warning("[ATOMIC] Task %s finished with 0 products - skip DB sync.", task_id)
             return [], [], []
-        
+
         # INTEGRITY CHECK: Reject incomplete scrapes
         peak = task.peak_product_count or 0
         active_in_db = sum(1 for p in all_db_products if p.removed_at is None)
-        reference_count = max(peak, active_in_db)
-        
+        reference_count = int(task.integrity_reference_count or 0)
+        if reference_count <= 0:
+            reference_count = max(peak, active_in_db)
+
         if reference_count >= _INTEGRITY_MIN_REFERENCE_COUNT:
-            integrity_ratio = _required_integrity_ratio(reference_count)
+            thresholds = _integrity_thresholds(reference_count)
+            integrity_ratio = float(thresholds["integrity_ratio"])
+            min_required_count = int(thresholds["min_required_count"])
+            allowed_shortfall = int(thresholds["allowed_shortfall"])
+            ratio_required_count = int(thresholds["ratio_required_count"])
+            count_required_floor = int(thresholds["count_required_floor"])
             scrape_ratio = len(current_products) / reference_count
-            if scrape_ratio < integrity_ratio:
+            if len(current_products) < min_required_count:
+                _save_integrity_review_state(
+                    task_id,
+                    current_products,
+                    reference_count=reference_count,
+                    integrity_ratio=integrity_ratio,
+                    scrape_ratio=scrape_ratio,
+                    allowed_shortfall=allowed_shortfall,
+                    min_required_count=min_required_count,
+                    ratio_required_count=ratio_required_count,
+                    count_required_floor=count_required_floor,
+                )
                 logger.warning(
-                    "[ATOMIC] Task %s: Scrape incomplete - got %d products, expected ~%d (ratio=%.2f < %.2f). "
-                    "REJECTING this scrape - will retry later.",
-                    task_id, len(current_products), reference_count, scrape_ratio, integrity_ratio
+                    "[ATOMIC] Task %s: Scrape incomplete - got %d products, expected ~%d "
+                    "(ratio=%.2f, ratio_floor=%d, count_floor=%d, shortfall_allow=%d, min_required=%d). "
+                    "REJECTING this scrape - waiting for manual confirmation.",
+                    task_id,
+                    len(current_products),
+                    reference_count,
+                    scrape_ratio,
+                    ratio_required_count,
+                    count_required_floor,
+                    allowed_shortfall,
+                    min_required_count,
                 )
-                # Raise exception so scheduler knows to retry
                 raise ScrapeIncomplete(
-                    f"Got {len(current_products)} products, expected ~{reference_count} (ratio={scrape_ratio:.2f})"
+                    "Low-count integrity review pending: "
+                    f"got {len(current_products)} / ref {reference_count} "
+                    f"(ratio={scrape_ratio:.2f}, min_required={min_required_count}, "
+                    f"allowed_shortfall={allowed_shortfall})"
                 )
-        
+            clear_pending_integrity_review(task_id)
+        else:
+            clear_pending_integrity_review(task_id)
+
         # Update peak if we got more products than ever before
         if len(current_products) > peak:
             task.peak_product_count = len(current_products)
             logger.info("Task %s: New peak product count: %d (was %d)", task_id, len(current_products), peak)
+        if (task.integrity_reference_count or 0) <= 0:
+            task.integrity_reference_count = reference_count or len(current_products)
+        if len(current_products) > (task.integrity_reference_count or 0):
+            task.integrity_reference_count = len(current_products)
         
         # Clean noise products from DB
         noise_ids = {p.id for p in all_db_products if _is_noise_title(p.name)}
@@ -1341,9 +1759,6 @@ def _sync_products_to_db(
             all_db_products = [p for p in all_db_products if p.id not in noise_ids]
             logger.info("Task %s: removed %d noise products from DB.", task_id, len(noise_ids))
         
-        # Filter noise from current scrape
-        current_products = [item for item in current_products if not _is_noise_title(item.get("name"))]
-        current_products = _dedupe_scraped_products(current_products)
         active_db_products = [p for p in all_db_products if p.removed_at is None]
 
         confirmation_reason = _pending_catalog_shift_confirmation(
@@ -1353,12 +1768,16 @@ def _sync_products_to_db(
             current_products,
         )
         if confirmation_reason:
-            logger.warning("[ATOMIC] Task %s: %s. REJECTING this scrape - will retry later.", task_id, confirmation_reason)
+            logger.warning(
+                "[ATOMIC] Task %s: %s. REJECTING this scrape - waiting for manual confirmation.",
+                task_id,
+                confirmation_reason,
+            )
             raise ScrapeIncomplete(confirmation_reason)
 
-        # Build lookup sets
-        db_asins = {p.asin for p in all_db_products if p.asin}
-        db_links = {p.product_link for p in all_db_products}
+        # Keep the per-task catalog complete, but only alert on products the system has never seen before.
+        task_db_asins, task_db_links = _known_product_sets(all_db_products)
+        global_db_asins, global_db_links = _load_global_product_sets(db)
         current_asins = {item["asin"] for item in current_products if item.get("asin")}
         current_links = {item["link"] for item in current_products}
         
@@ -1366,16 +1785,28 @@ def _sync_products_to_db(
         new_products: List[Dict[str, str]] = []
         for item in current_products:
             asin = item.get("asin", "")
-            is_known = (asin and asin in db_asins) or item["link"] in db_links
-            if not is_known:
+            link = item["link"]
+            known_in_task = (asin and asin in task_db_asins) or link in task_db_links
+            known_globally = (asin and asin in global_db_asins) or link in global_db_links
+            if known_in_task:
+                continue
+            is_new_discovery = not known_globally
+            if not known_globally:
                 new_products.append(item)
-                db.add(ProductItem(
-                    task_id=task_id,
-                    product_link=item["link"],
-                    asin=asin or None,
-                    name=item["name"],
-                    miss_count=0,
-                ))
+            db.add(ProductItem(
+                task_id=task_id,
+                product_link=link,
+                asin=asin or None,
+                name=item["name"],
+                discovered_at=now,
+                is_new_discovery=is_new_discovery,
+                miss_count=0,
+            ))
+            if asin:
+                task_db_asins.add(asin)
+                global_db_asins.add(asin)
+            task_db_links.add(link)
+            global_db_links.add(link)
         
         removed_products: List[Dict[str, str]] = []
         if _TRACK_REMOVALS:
@@ -1441,7 +1872,11 @@ def _sync_products_to_db(
         
         # Back-fill ASIN for older DB rows
         _backfill_asins(all_db_products, current_products)
-        
+
+        # Record every scraped product in the permanent registry so it can
+        # never be reported as "new" again, even after task deletion/pruning.
+        _register_seen_products(db, current_products)
+
         # ATOMIC COMMIT - all changes at once
         db.commit()
         
@@ -1480,6 +1915,114 @@ def _backfill_asins(
     for p in db_products:
         if not p.asin and p.product_link in link_to_asin:
             p.asin = link_to_asin[p.product_link]
+
+
+def accept_pending_integrity_review(db: Session, task_id: int) -> Dict[str, int] | None:
+    task = db.query(MonitorTask).filter(MonitorTask.id == task_id).first()
+    if not task:
+        return None
+
+    pending_state = _load_integrity_review_state(task_id)
+    if not pending_state:
+        return None
+
+    products_raw = pending_state.get("products")
+    if not isinstance(products_raw, list):
+        clear_pending_integrity_review(task_id)
+        return None
+
+    current_products = _sanitize_review_products(products_raw)
+    if not current_products:
+        clear_pending_integrity_review(task_id)
+        return None
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    all_db_products = db.query(ProductItem).filter(ProductItem.task_id == task_id).all()
+
+    noise_ids = {p.id for p in all_db_products if _is_noise_title(p.name)}
+    if noise_ids:
+        for product in all_db_products:
+            if product.id in noise_ids:
+                db.delete(product)
+        all_db_products = [product for product in all_db_products if product.id not in noise_ids]
+
+    task_db_asins, task_db_links = _known_product_sets(all_db_products)
+    global_db_asins, global_db_links = _load_global_product_sets(db)
+    current_asins = {item["asin"] for item in current_products if item.get("asin")}
+    current_links = {item["link"] for item in current_products}
+
+    new_count = 0
+    for item in current_products:
+        asin = item.get("asin", "")
+        link = item["link"]
+        known_in_task = (asin and asin in task_db_asins) or link in task_db_links
+        known_globally = (asin and asin in global_db_asins) or link in global_db_links
+        if known_in_task:
+            continue
+        db.add(ProductItem(
+            task_id=task_id,
+            product_link=link,
+            asin=asin or None,
+            name=item["name"],
+            discovered_at=now,
+            is_new_discovery=not known_globally,
+            miss_count=0,
+        ))
+        if not known_globally:
+            new_count += 1
+        if asin:
+            task_db_asins.add(asin)
+            global_db_asins.add(asin)
+        task_db_links.add(link)
+        global_db_links.add(link)
+
+    removed_count = 0
+    for product in all_db_products:
+        is_present = (
+            (product.asin and product.asin in current_asins)
+            or product.product_link in current_links
+        )
+        if is_present:
+            product.removed_at = None
+            product.miss_count = 0
+            matched = next((item for item in current_products if item["link"] == product.product_link), None)
+            if matched and matched.get("name"):
+                product.name = matched["name"]
+            if matched and matched.get("asin") and not product.asin:
+                product.asin = matched["asin"]
+            continue
+        if product.removed_at is None:
+            product.removed_at = now
+            product.miss_count = 0
+            removed_count += 1
+
+    _backfill_asins(all_db_products, current_products)
+    _register_seen_products(db, current_products)
+
+    task.integrity_reference_count = len(current_products)
+    task.peak_product_count = max(task.peak_product_count or 0, len(current_products))
+    task.consecutive_empty_count = 0
+    task.consecutive_failure_count = 0
+    task.health_state = "healthy"
+    task.manual_review_pending = False
+    task.manual_review_kind = None
+    task.manual_review_scope_key = None
+    task.manual_review_scope_label = None
+    task.manual_review_scope_kind = None
+    task.manual_review_started_at = None
+    task.last_failure_at = None
+    task.last_failure_reason = None
+    task.last_run_at = now
+    task.next_run_at = now + datetime.timedelta(hours=task.check_interval_hours)
+
+    db.commit()
+    clear_pending_integrity_review(task_id)
+    _clear_catalog_shift_state(task_id)
+    return {
+        "current_count": len(current_products),
+        "new_count": new_count,
+        "removed_count": removed_count,
+    }
 
 
 _SCRAPE_TIMEOUT = 7200  # Max seconds for a single browser scrape (2 hours).
@@ -1543,7 +2086,15 @@ def _run_browser_scrape_with_timeout(task: MonitorTask) -> List[Dict[str, str]]:
     """
     result: List[Dict[str, str]] = []
     error: List[Exception] = []
-    runtime = _ScrapeRuntime()
+    runtime = _ScrapeRuntime(task)
+    traffic_finished = False
+
+    def _finish_traffic(status: str) -> None:
+        nonlocal traffic_finished
+        if traffic_finished:
+            return
+        runtime.finish_traffic(status)
+        traffic_finished = True
 
     def _target():
         _set_scrape_runtime(runtime)
@@ -1580,6 +2131,7 @@ def _run_browser_scrape_with_timeout(task: MonitorTask) -> List[Dict[str, str]]:
             if t.is_alive():
                 logger.warning("Task %s scrape thread still alive after idle-timeout cleanup.", task.id)
             clear_cancel_scrape()
+            _finish_traffic("partial_timeout")
             return partial  # Return partial results if any.
         
         # Hard limit as fallback (e.g., 10x the activity timeout).
@@ -1595,22 +2147,41 @@ def _run_browser_scrape_with_timeout(task: MonitorTask) -> List[Dict[str, str]]:
             if t.is_alive():
                 logger.warning("Task %s scrape thread still alive after hard-timeout cleanup.", task.id)
             clear_cancel_scrape()
+            _finish_traffic("partial_timeout")
             return partial  # Return partial results.
 
     if error:
+        exc = error[0]
+        if isinstance(exc, ScrapeCancelled):
+            _finish_traffic("cancelled")
+        else:
+            _finish_traffic("failed")
         raise error[0]
+    _finish_traffic("success")
     return result
 
 
 def _kill_zombie_browsers():
-    """Best-effort cleanup of orphaned Chromium processes spawned by Playwright."""
+    """Best-effort cleanup of orphaned Chromium processes spawned by Playwright.
+
+    Only kills browser/driver processes whose executable path belongs to a
+    Playwright installation — never the user's own Chrome/Chromium.
+    """
     try:
         import subprocess
-        commands = []
         if os.name == "nt":
+            # Match Playwright-managed browsers (".../playwright-browsers/..." or
+            # "%LOCALAPPDATA%/ms-playwright/...") and orphaned Playwright node
+            # drivers, but leave the user's personal browsers untouched.
+            ps_script = (
+                "Get-Process chrome,chromium,msedge,headless_shell,node "
+                "-ErrorAction SilentlyContinue | "
+                "Where-Object { $_.Path -and ("
+                "$_.Path -like '*playwright*' -or $_.Path -like '*ms-playwright*'"
+                ") } | Stop-Process -Force -ErrorAction SilentlyContinue"
+            )
             commands = [
-                ["taskkill", "/F", "/IM", "chromium.exe", "/T"],
-                ["taskkill", "/F", "/IM", "chrome.exe", "/T"],
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
             ]
         else:
             commands = [
@@ -1620,7 +2191,7 @@ def _kill_zombie_browsers():
 
         for command in commands:
             try:
-                subprocess.run(command, capture_output=True, timeout=10, check=False)
+                subprocess.run(command, capture_output=True, timeout=20, check=False)
             except FileNotFoundError:
                 logger.debug("Browser cleanup command not available: %s", command[0])
     except Exception as exc:
@@ -1669,6 +2240,7 @@ def _create_browser_context(task: MonitorTask):
             logger.info("Reusing Playwright storage state: %s", storage_state)
 
         context = browser.new_context(**context_kwargs)
+        _install_network_request_guard(context)
         # Reduce basic automation fingerprints.
         context.add_init_script(
             """
@@ -1679,6 +2251,7 @@ def _create_browser_context(task: MonitorTask):
             """
         )
         page = context.new_page()
+        _attach_traffic_listeners(page)
         page.on("dialog", lambda dialog: dialog.dismiss())
         page.set_default_timeout(45000)
         page.set_default_navigation_timeout(90000)
@@ -1688,7 +2261,11 @@ def _create_browser_context(task: MonitorTask):
         # Pre-warm homepage to set cookies before hitting target.
         logger.debug("Pre-warming homepage: %s", base_url)
         try:
-            page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
+            safe_base_url = validate_monitor_target_url(base_url, force_dns_refresh=True)
+            page.goto(safe_base_url, wait_until="domcontentloaded", timeout=45000)
+            final_url = (page.url or "").strip()
+            if final_url:
+                validate_monitor_target_url(final_url, force_dns_refresh=True)
             _dismiss_common_overlays(page)
             _ensure_amazon_us_delivery(page, task.url)
             time.sleep(random.uniform(0.8, 1.6))

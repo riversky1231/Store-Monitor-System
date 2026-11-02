@@ -30,7 +30,3 @@ def register_routes(app):
     app.include_router(groups_router)    # /tasks, /tasks/group-create, etc.
     app.include_router(tasks_router)     # /tasks/group/{id}, /tasks/{id}, etc.
     app.include_router(settings_router)  # /settings
-
-
-from .dashboard import router
-from .settings import public_router

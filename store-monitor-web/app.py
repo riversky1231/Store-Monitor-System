@@ -12,7 +12,7 @@ import pystray
 from PIL import Image
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from contextlib import asynccontextmanager
@@ -20,6 +20,7 @@ from contextlib import asynccontextmanager
 from database import run_migrations, SessionLocal
 from models import SystemConfig
 from scheduler import init_scheduler, shutdown_scheduler
+from security import is_trusted_write_request, security_response_headers, validate_proxy_url
 from utils import get_resource_path, get_runtime_data_path
 
 # ---------------------------------------------------------------------------
@@ -77,11 +78,16 @@ def _apply_proxy_from_db() -> None:
         config = db.query(SystemConfig).first()
         proxy = (config.proxy_url or "").strip() if config else ""
         if proxy:
-            os.environ["HTTP_PROXY"] = proxy
-            os.environ["HTTPS_PROXY"] = proxy
+            validated_proxy = validate_proxy_url(proxy)
+            os.environ["HTTP_PROXY"] = validated_proxy
+            os.environ["HTTPS_PROXY"] = validated_proxy
         else:
             os.environ.pop("HTTP_PROXY", None)
             os.environ.pop("HTTPS_PROXY", None)
+    except ValueError as exc:
+        logger.warning("Ignoring invalid proxy URL from database: %s", exc)
+        os.environ.pop("HTTP_PROXY", None)
+        os.environ.pop("HTTPS_PROXY", None)
     except Exception as exc:
         logger.warning("Failed to load proxy from database: %s", exc)
     finally:
@@ -232,7 +238,44 @@ def _install_playwright_browser() -> None:
         stdout = (result.stdout or b"").decode("utf-8", errors="ignore").strip()
         logger.warning("Playwright install failed (code=%s): %s", result.returncode, stderr or stdout)
 
+def _cleanup_stale_pyinstaller_temp() -> None:
+    """Remove leftover PyInstaller onefile extraction dirs (_MEIxxxxxx).
+
+    Each launch of the onefile EXE extracts ~700 MB into %TEMP%. Crashes and
+    power cuts leave those folders behind, silently eating gigabytes of disk
+    over a few days. Folders belonging to running instances are locked and
+    survive the delete attempt, so this is safe to run on every startup.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        import shutil
+
+        current = os.path.normcase(getattr(sys, "_MEIPASS", "") or "")
+        temp_dir = tempfile.gettempdir()
+        removed = 0
+        for entry in os.scandir(temp_dir):
+            if not entry.name.startswith("_MEI") or not entry.is_dir(follow_symlinks=False):
+                continue
+            if current and os.path.normcase(entry.path) == current:
+                continue
+            try:
+                # Only clean folders idle for 1+ hour to avoid racing a
+                # just-launched second instance.
+                if time.time() - entry.stat().st_mtime < 3600:
+                    continue
+                shutil.rmtree(entry.path, ignore_errors=False)
+                removed += 1
+            except OSError:
+                continue  # locked by a live process — leave it alone
+        if removed:
+            logger.info("Cleaned %d stale PyInstaller temp folder(s).", removed)
+    except Exception as exc:
+        logger.warning("Stale temp cleanup failed: %s", exc)
+
+
 threading.Thread(target=_ensure_playwright_browser, daemon=True).start()
+threading.Thread(target=_cleanup_stale_pyinstaller_temp, daemon=True).start()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -272,18 +315,29 @@ async def setup_guard(request: Request, call_next):
         return RedirectResponse(url="/setup", status_code=302)
     return await call_next(request)
 
-# Static and Templates paths
+
+@app.middleware("http")
+async def browser_security_guard(request: Request, call_next):
+    """Block cross-site browser writes and attach baseline browser protections."""
+    if not is_trusted_write_request(request):
+        logger.warning(
+            "Blocked cross-site write request: method=%s path=%s origin=%s fetch_site=%s",
+            request.method,
+            request.url.path,
+            request.headers.get("origin", ""),
+            request.headers.get("sec-fetch-site", ""),
+        )
+        response = PlainTextResponse("Cross-site request blocked.", status_code=403)
+    else:
+        response = await call_next(request)
+
+    for name, value in security_response_headers(request).items():
+        response.headers.setdefault(name, value)
+    return response
+
+# Static files
 static_dir = get_resource_path("static")
-templates_dir = get_resource_path("templates")
-
-# Ensure static subdirs exist in CWD for logs/db if needed, 
-# but for serving static, we use the bundled one.
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
-templates = Jinja2Templates(directory=templates_dir)
-
-# Add custom filter to convert UTC to Beijing time (UTC+8)
-from utils import to_beijing_time
-templates.env.filters["beijing"] = to_beijing_time
 
 from routes import register_routes
 register_routes(app)
@@ -293,8 +347,13 @@ import tkinter as tk
 from tkinter import scrolledtext
 import queue
 
-# Create a queue for thread-safe cross-thread UI updates
-log_queue = queue.Queue()
+# Create a queue for thread-safe cross-thread UI updates.
+# Bounded so a stalled Tk mainloop can't make the process eat memory forever.
+log_queue = queue.Queue(maxsize=10000)
+
+# Keep only the most recent console lines; unbounded growth of the Tk text
+# widget is a slow memory leak that degrades/kills long-running instances.
+_CONSOLE_MAX_LINES = 2000
 
 class ConsoleEmulator:
     def __init__(self, root):
@@ -318,7 +377,12 @@ class ConsoleEmulator:
         self.root.after(100, self.process_queue)
 
     def write(self, text):
-        log_queue.put(text)
+        try:
+            log_queue.put_nowait(text)
+        except queue.Full:
+            # Drop console output rather than blocking worker threads;
+            # the rotating file log still captures everything.
+            pass
 
     def flush(self):
         pass
@@ -330,14 +394,26 @@ class ConsoleEmulator:
         raise io.UnsupportedOperation("fileno")
 
     def process_queue(self):
+        appended = False
         while True:
             try:
                 msg = log_queue.get_nowait()
                 self.text_area.insert(tk.END, msg)
-                self.text_area.see(tk.END)
+                appended = True
             except queue.Empty:
                 break
+        if appended:
+            self._trim_old_lines()
+            self.text_area.see(tk.END)
         self.root.after(100, self.process_queue)
+
+    def _trim_old_lines(self):
+        try:
+            line_count = int(self.text_area.index("end-1c").split(".")[0])
+            if line_count > _CONSOLE_MAX_LINES:
+                self.text_area.delete("1.0", f"{line_count - _CONSOLE_MAX_LINES}.0")
+        except Exception:
+            pass
 
     def show(self):
         self.root.deiconify()
@@ -352,6 +428,45 @@ def open_browser():
     print(f"正在打开监控后台: {url}")
     # open_new=0 asks the browser to reuse an existing window rather than a new tab.
     webbrowser.open(url, new=0)
+
+_AUTOSTART_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_AUTOSTART_VALUE_NAME = "AmazonStoreMonitor"
+
+
+def _autostart_supported() -> bool:
+    return os.name == "nt" and getattr(sys, "frozen", False)
+
+
+def _autostart_enabled() -> bool:
+    if not _autostart_supported():
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_REG_KEY) as key:
+            value, _ = winreg.QueryValueEx(key, _AUTOSTART_VALUE_NAME)
+        return bool(value)
+    except OSError:
+        return False
+
+
+def _toggle_autostart(icon=None, item=None) -> None:
+    if not _autostart_supported():
+        print("开机自启动仅在打包版 (EXE) 中可用。")
+        return
+    try:
+        import winreg
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_REG_KEY) as key:
+            if _autostart_enabled():
+                winreg.DeleteValue(key, _AUTOSTART_VALUE_NAME)
+                print("已关闭开机自启动。")
+                logger.info("Autostart disabled.")
+            else:
+                winreg.SetValueEx(key, _AUTOSTART_VALUE_NAME, 0, winreg.REG_SZ, f'"{sys.executable}"')
+                print("已开启开机自启动，电脑重启后程序会自动在后台运行。")
+                logger.info("Autostart enabled: %s", sys.executable)
+    except OSError as exc:
+        logger.warning("Failed to toggle autostart: %s", exc)
+
 
 def quit_app(icon, item, root):
     print("正在彻底退出程序...")
@@ -369,6 +484,7 @@ def start_tray(console_ui, root):
     menu = pystray.Menu(
         pystray.MenuItem("打开监控后台", open_browser, default=True),
         pystray.MenuItem("查看运行日志 (Show Console)", lambda: console_ui.show()),
+        pystray.MenuItem("开机自启动", _toggle_autostart, checked=lambda item: _autostart_enabled()),
         pystray.MenuItem("退出程序", lambda icon, item: quit_app(icon, item, root))
     )
 
@@ -376,10 +492,26 @@ def start_tray(console_ui, root):
     icon.run()
 
 def run_server_sync():
-    # Use config to run without signal handlers for thread safety
-    config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="info", loop="asyncio")
-    server = uvicorn.Server(config)
-    server.run()
+    """Run uvicorn with automatic restart.
+
+    The server runs in a daemon thread while the tray keeps the process alive.
+    Without this loop, any server crash (port conflict at startup, runtime
+    error in the event loop) silently kills the web console AND the scheduler
+    started by the FastAPI lifespan — the tray icon stays green for days while
+    nothing actually works.
+    """
+    backoff = 5
+    while True:
+        try:
+            # Fresh Server instance each attempt; reusing a crashed one is unsafe.
+            config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="info", loop="asyncio")
+            server = uvicorn.Server(config)
+            server.run()
+            logger.error("Web server stopped unexpectedly; restarting in %ds.", backoff)
+        except Exception:
+            logger.exception("Web server crashed; restarting in %ds.", backoff)
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 300)
 
 if __name__ == "__main__":
     # Prevent multiple instances on Windows using a named mutex.
@@ -399,8 +531,11 @@ if __name__ == "__main__":
     sys.stdout = console_ui
     sys.stderr = console_ui
     # Route logging stream handler to the console UI (avoid None stream in GUI mode).
+    # NOTE: FileHandler subclasses StreamHandler — must be excluded, otherwise
+    # the rotating file log gets silently redirected to the Tk console and the
+    # log file stays empty forever.
     for handler in logging.getLogger().handlers:
-        if isinstance(handler, logging.StreamHandler):
+        if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
             handler.setStream(console_ui)
 
     print("=========================================")

@@ -31,60 +31,121 @@
       <div class="stat-val">{{ products_count }}</div>
     </div>
   </div>
+  <div class="stat">
+    <div class="stat-ico" style="background:#f0f7ff;color:#2a7ed6">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 6a2 2 0 0 1 2-2h4v2H6v12h4v2H6a2 2 0 0 1-2-2V6zm9.71.29L18.41 11H9v2h9.41l-4.7 4.71 1.42 1.41L22.24 12l-7.11-7.12-1.42 1.41z"/></svg>
+    </div>
+    <div>
+      <div class="stat-lbl">累计下载流量</div>
+      <div class="stat-val" id="trafficTotalDownloadValue">{{ traffic_stats.totals.download_human }}</div>
+    </div>
+  </div>
+  <div class="stat">
+    <div class="stat-ico" style="background:#ecfbf4;color:#169263">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 5h18v4H3V5zm0 5h18v4H3v-4zm0 5h18v4H3v-4z"/></svg>
+    </div>
+    <div>
+      <div class="stat-lbl">累计请求数</div>
+      <div class="stat-val" id="trafficTotalRequestsValue">{{ traffic_stats.totals.request_count }}</div>
+    </div>
+  </div>
+  <div class="stat">
+    <div class="stat-ico" style="background:#fff5ea;color:#c97a14">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M13 3a9 9 0 1 0 8.95 10H20a7 7 0 1 1-1.95-4.84L16 10h6V4l-2.55 2.55A8.96 8.96 0 0 0 13 3zm-1 5h2v5l4.25 2.52-1 1.73L12 14V8z"/></svg>
+    </div>
+    <div>
+      <div class="stat-lbl">最近抓取流量</div>
+      <div class="stat-val" id="trafficLastDownloadValue">{{ traffic_stats.last_completed_task.download_human if traffic_stats.last_completed_task else "-" }}</div>
+    </div>
+  </div>
 </div>
 
 <div class="card">
   <div class="card-head">
-    <span class="card-title">任务健康状态</span>
+    <span class="card-title">抓取流量</span>
+    <span class="txt-m txt-s">统计口径：自应用启动以来</span>
   </div>
-  <div class="tbl-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>任务名称</th>
-          <th>健康状态</th>
-          <th>连续空抓次数</th>
-          <th>可能原因</th>
-          <th>操作</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for task in unhealthy_tasks %}
-        <tr>
-          <td class="td-bold">{{ task.name }}</td>
-          <td>
-            {% if task.health_state == "alert" %}
-            <span class="badge b-alert"><i></i>告警中</span>
-            {% else %}
-            <span class="badge b-warn"><i></i>需关注</span>
-            {% endif %}
-          </td>
-          <td class="txt-m">{{ task.consecutive_empty_count }} / {{ empty_alert_threshold }}</td>
-          <td style="font-size:12px;color:var(--text-sub);max-width:200px">
-            {% if task.consecutive_empty_count >= empty_alert_threshold %}
-            IP 被封 / 页面改版 / URL 失效
-            {% else %}
-            网络波动 / 临时反爬
-            {% endif %}
-          </td>
-          <td style="white-space:nowrap">
-            <form action="/tasks/{{ task.id }}/run" method="post" style="display:inline">
-              <button type="submit" class="btn btn-primary" style="font-size:12px;padding:4px 10px">立即重试</button>
-            </form>
-            {% if task.category_id %}
-            <a href="/tasks/group/{{ task.category_id }}?highlight={{ task.id }}" class="btn btn-ghost" style="font-size:12px;padding:4px 10px">查看任务</a>
-            {% endif %}
-            <form action="/tasks/{{ task.id }}/reset-health" method="post" style="display:inline"
-                  onsubmit="return confirm('确认重置健康状态？计数将归零。')">
-              <button type="submit" class="btn btn-ghost" style="font-size:12px;padding:4px 10px;color:#6b7280">重置</button>
-            </form>
-          </td>
-        </tr>
-        {% else %}
-        <tr><td colspan="5" class="td-empty">所有任务运行正常</td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
+  <div class="traffic-panel">
+    <div class="traffic-summary">
+      <div class="traffic-chip">
+        <span>统计周期</span>
+        <strong id="trafficStartedSinceValue">{{ traffic_stats.started_since_label }}</strong>
+      </div>
+      <div class="traffic-chip">
+        <span>已完成抓取</span>
+        <strong id="trafficCompletedTasksValue">{{ traffic_stats.totals.completed_task_count }}</strong>
+      </div>
+      <div class="traffic-chip">
+        <span>累计上传流量</span>
+        <strong id="trafficTotalUploadValue">{{ traffic_stats.totals.upload_human }}</strong>
+      </div>
+    </div>
+
+    <div class="traffic-columns">
+      <section class="traffic-block">
+        <div class="traffic-block-title">当前任务</div>
+        <div class="traffic-task-name" id="trafficActiveName">{{ traffic_stats.active_task.task_name if traffic_stats.active_task else "当前无抓取任务" }}</div>
+        <div class="traffic-task-meta" id="trafficActiveMeta">
+          {% if traffic_stats.active_task %}
+            {{ traffic_stats.active_task.status }} · {{ traffic_stats.active_task.duration_label }} · {{ traffic_stats.active_task.download_human }} · {{ traffic_stats.active_task.request_count }} 请求
+          {% else %}
+            等待调度器执行下一次抓取
+          {% endif %}
+        </div>
+        <div class="traffic-task-note" id="trafficActiveNote">
+          {% if traffic_stats.active_task and traffic_stats.active_task.unknown_response_count %}
+            仍有 {{ traffic_stats.active_task.unknown_response_count }} 个响应未能精确计量
+          {% else %}
+            实时显示当前抓取的请求和下载流量
+          {% endif %}
+        </div>
+        <ul class="traffic-breakdown" id="trafficActiveBreakdown">
+          {% if traffic_stats.active_task and traffic_stats.active_task.resource_breakdown %}
+            {% for item in traffic_stats.active_task.resource_breakdown[:6] %}
+            <li>
+              <span>{{ item.type }}</span>
+              <strong>{{ item.download_human }}</strong>
+              <em>{{ item.request_count }} 请求</em>
+            </li>
+            {% endfor %}
+          {% else %}
+            <li class="traffic-breakdown-empty">暂无实时请求</li>
+          {% endif %}
+        </ul>
+      </section>
+
+      <section class="traffic-block">
+        <div class="traffic-block-title">最近任务</div>
+        <div class="traffic-task-name" id="trafficLastName">{{ traffic_stats.last_completed_task.task_name if traffic_stats.last_completed_task else "暂无完成记录" }}</div>
+        <div class="traffic-task-meta" id="trafficLastMeta">
+          {% if traffic_stats.last_completed_task %}
+            {{ traffic_stats.last_completed_task.status }} · {{ traffic_stats.last_completed_task.duration_label }} · {{ traffic_stats.last_completed_task.download_human }} · {{ traffic_stats.last_completed_task.request_count }} 请求
+          {% else %}
+            等待首个抓取任务完成
+          {% endif %}
+        </div>
+        <div class="traffic-task-note" id="trafficLastNote">
+          {% if traffic_stats.last_completed_task and traffic_stats.last_completed_task.unknown_response_count %}
+            有 {{ traffic_stats.last_completed_task.unknown_response_count }} 个响应未能精确计量
+          {% else %}
+            展示最近一次完成的抓取流量概况
+          {% endif %}
+        </div>
+        <ul class="traffic-breakdown" id="trafficLastBreakdown">
+          {% if traffic_stats.last_completed_task and traffic_stats.last_completed_task.resource_breakdown %}
+            {% for item in traffic_stats.last_completed_task.resource_breakdown[:6] %}
+            <li>
+              <span>{{ item.type }}</span>
+              <strong>{{ item.download_human }}</strong>
+              <em>{{ item.request_count }} 请求</em>
+            </li>
+            {% endfor %}
+          {% else %}
+            <li class="traffic-breakdown-empty">暂无历史流量</li>
+          {% endif %}
+        </ul>
+      </section>
+    </div>
   </div>
 </div>
 
@@ -106,7 +167,7 @@
         {% for item in recent_products %}
         <tr>
           <td class="td-bold" style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ item.name }}</td>
-          <td><span class="tag">{{ item.task.name }}</span></td>
+          <td><span class="tag">{{ item.task_name }}</span></td>
           <td class="txt-m txt-s">
             {% if item.discovered_at %}
               {{ item.discovered_at.strftime('%m-%d %H:%M') }}
@@ -123,5 +184,111 @@
     </table>
   </div>
 </div>
+
+<script>
+  (function () {
+    function setText(id, value) {
+      const el = document.getElementById(id);
+      if (el) {
+        el.textContent = value;
+      }
+    }
+
+    function renderBreakdown(containerId, rows, emptyText) {
+      const container = document.getElementById(containerId);
+      if (!container) {
+        return;
+      }
+      container.innerHTML = "";
+      if (!Array.isArray(rows) || rows.length === 0) {
+        const empty = document.createElement("li");
+        empty.className = "traffic-breakdown-empty";
+        empty.textContent = emptyText;
+        container.appendChild(empty);
+        return;
+      }
+
+      rows.slice(0, 6).forEach(function (row) {
+        const item = document.createElement("li");
+        const label = document.createElement("span");
+        label.textContent = row.type || "other";
+        const bytes = document.createElement("strong");
+        bytes.textContent = row.download_human || "0 B";
+        const count = document.createElement("em");
+        count.textContent = String(row.request_count || 0) + " 请求";
+        item.appendChild(label);
+        item.appendChild(bytes);
+        item.appendChild(count);
+        container.appendChild(item);
+      });
+    }
+
+    function renderTask(prefix, task, emptyName, emptyMeta, emptyBreakdown) {
+      if (!task) {
+        setText(prefix + "Name", emptyName);
+        setText(prefix + "Meta", emptyMeta);
+        setText(prefix + "Note", prefix === "trafficActive" ? "实时显示当前抓取的请求和下载流量" : "展示最近一次完成的抓取流量概况");
+        renderBreakdown(prefix + "Breakdown", [], emptyBreakdown);
+        return;
+      }
+
+      setText(prefix + "Name", task.task_name || emptyName);
+      setText(
+        prefix + "Meta",
+        [
+          task.status || "unknown",
+          task.duration_label || "0s",
+          task.download_human || "0 B",
+          String(task.request_count || 0) + " 请求"
+        ].join(" · ")
+      );
+      setText(
+        prefix + "Note",
+        Number(task.unknown_response_count || 0) > 0
+          ? "仍有 " + String(task.unknown_response_count) + " 个响应未能精确计量"
+          : (prefix === "trafficActive" ? "实时显示当前抓取的请求和下载流量" : "展示最近一次完成的抓取流量概况")
+      );
+      renderBreakdown(prefix + "Breakdown", task.resource_breakdown || [], emptyBreakdown);
+    }
+
+    function refreshTrafficStats() {
+      window.fetch("/api/traffic-stats", { cache: "no-store" })
+        .then(function (response) { return response.json(); })
+        .then(function (data) {
+          if (!data || !data.totals) {
+            return;
+          }
+          setText("trafficTotalDownloadValue", data.totals.download_human || "0 B");
+          setText("trafficTotalRequestsValue", String(data.totals.request_count || 0));
+          setText("trafficTotalUploadValue", data.totals.upload_human || "0 B");
+          setText("trafficCompletedTasksValue", String(data.totals.completed_task_count || 0));
+          setText("trafficStartedSinceValue", data.started_since_label || "0s");
+          setText(
+            "trafficLastDownloadValue",
+            data.last_completed_task ? (data.last_completed_task.download_human || "0 B") : "-"
+          );
+
+          renderTask(
+            "trafficActive",
+            data.active_task,
+            "当前无抓取任务",
+            "等待调度器执行下一次抓取",
+            "暂无实时请求"
+          );
+          renderTask(
+            "trafficLast",
+            data.last_completed_task,
+            "暂无完成记录",
+            "等待首个抓取任务完成",
+            "暂无历史流量"
+          );
+        })
+        .catch(function () {});
+    }
+
+    refreshTrafficStats();
+    window.setInterval(refreshTrafficStats, 10000);
+  })();
+</script>
 
 {% endblock %}

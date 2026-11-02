@@ -77,9 +77,53 @@ def run_migrations():
     """Run Alembic migrations when available, with safe fallback for packaged mode."""
     if _run_alembic_migrations():
         _normalize_product_history_for_current_policy()
+        _backfill_seen_products()
         return
     _run_legacy_migrations()
     _normalize_product_history_for_current_policy()
+    _backfill_seen_products()
+
+
+def _backfill_seen_products() -> None:
+    """Idempotently seed the permanent seen-products registry from product history.
+
+    Keeps lifetime new-product dedup correct even on databases migrated through
+    the legacy (non-Alembic) path, where the table is created without backfill.
+    """
+    try:
+        with engine.connect() as conn:
+            existing_tables = {
+                row[0]
+                for row in conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table'")
+                )
+            }
+            if "seen_products" not in existing_tables or "product_items" not in existing_tables:
+                return
+            conn.execute(text(
+                """
+                INSERT OR IGNORE INTO seen_products (asin, product_link, name, first_seen_at)
+                SELECT UPPER(TRIM(asin)), MIN(product_link), MIN(name),
+                       MIN(COALESCE(discovered_at, CURRENT_TIMESTAMP))
+                FROM product_items
+                WHERE asin IS NOT NULL AND TRIM(asin) != ''
+                GROUP BY UPPER(TRIM(asin))
+                """
+            ))
+            conn.execute(text(
+                """
+                INSERT OR IGNORE INTO seen_products (asin, product_link, name, first_seen_at)
+                SELECT NULL, product_link, MIN(name),
+                       MIN(COALESCE(discovered_at, CURRENT_TIMESTAMP))
+                FROM product_items
+                WHERE (asin IS NULL OR TRIM(asin) = '')
+                  AND product_link IS NOT NULL AND TRIM(product_link) != ''
+                GROUP BY product_link
+                """
+            ))
+            conn.commit()
+    except Exception as exc:
+        logger.warning("Seen-products backfill skipped: %s", exc)
 
 
 def _run_alembic_migrations() -> bool:
@@ -114,21 +158,41 @@ def _run_legacy_migrations() -> None:
         _ensure_column(conn, "system_configs", "smtp_port", "INTEGER DEFAULT 465")
         _ensure_column(conn, "system_configs", "sender_email", "VARCHAR")
         _ensure_column(conn, "system_configs", "sender_password", "VARCHAR")
+        _ensure_column(conn, "system_configs", "backup_smtp_enabled", "BOOLEAN DEFAULT 0")
+        _ensure_column(conn, "system_configs", "backup_smtp_server", "VARCHAR")
+        _ensure_column(conn, "system_configs", "backup_smtp_port", "INTEGER DEFAULT 465")
+        _ensure_column(conn, "system_configs", "backup_sender_email", "VARCHAR")
+        _ensure_column(conn, "system_configs", "backup_sender_password", "VARCHAR")
+        _ensure_column(conn, "product_items", "discovered_at", "DATETIME")
         _ensure_column(conn, "product_items", "removed_at", "DATETIME")
         _ensure_column(conn, "product_items", "miss_count", "INTEGER DEFAULT 0")
+        _ensure_column(conn, "product_items", "is_new_discovery", "BOOLEAN DEFAULT 0")
         _ensure_column(conn, "system_configs", "product_retention_days", "INTEGER DEFAULT 90")
         _ensure_column(conn, "monitor_tasks", "consecutive_empty_count", "INTEGER DEFAULT 0")
         _ensure_column(conn, "monitor_tasks", "health_state", "VARCHAR DEFAULT 'healthy'")
+        _ensure_column(conn, "monitor_tasks", "manual_review_pending", "BOOLEAN DEFAULT 0")
+        _ensure_column(conn, "monitor_tasks", "manual_review_kind", "VARCHAR")
+        _ensure_column(conn, "monitor_tasks", "manual_review_scope_key", "VARCHAR")
+        _ensure_column(conn, "monitor_tasks", "manual_review_scope_label", "VARCHAR")
+        _ensure_column(conn, "monitor_tasks", "manual_review_scope_kind", "VARCHAR")
+        _ensure_column(conn, "monitor_tasks", "manual_review_started_at", "DATETIME")
         _ensure_column(conn, "monitor_tasks", "last_health_alert_at", "DATETIME")
         _ensure_column(conn, "monitor_tasks", "last_recovery_at", "DATETIME")
         _ensure_column(conn, "system_configs", "setup_complete", "BOOLEAN DEFAULT 0")
         _ensure_column(conn, "system_configs", "admin_password_enc", "VARCHAR")
         _ensure_column(conn, "system_configs", "proxy_url", "VARCHAR")
+        _ensure_column(conn, "system_configs", "last_daily_report_at", "DATETIME")
         _ensure_column(conn, "monitor_tasks", "category", "VARCHAR")
         _ensure_column(conn, "monitor_tasks", "category_id", "INTEGER REFERENCES categories(id)")
         _ensure_column(conn, "product_items", "asin", "VARCHAR")
         _ensure_column(conn, "monitor_tasks", "task_type", "VARCHAR DEFAULT 'search'")
+        _ensure_column(conn, "monitor_tasks", "integrity_reference_count", "INTEGER DEFAULT 0")
         _ensure_column(conn, "monitor_tasks", "peak_product_count", "INTEGER DEFAULT 0")
+        _ensure_column(conn, "monitor_tasks", "consecutive_failure_count", "INTEGER DEFAULT 0")
+        _ensure_column(conn, "monitor_tasks", "last_failure_at", "DATETIME")
+        _ensure_column(conn, "monitor_tasks", "last_failure_reason", "VARCHAR")
+        _ensure_column(conn, "monitor_tasks", "sort_order", "INTEGER DEFAULT 0")
+        _ensure_column(conn, "report_outbox", "next_attempt_at", "DATETIME")
         _migrate_legacy_system_config_columns(conn)
 
 
@@ -183,21 +247,30 @@ def _ensure_column(conn, table_name: str, column_name: str, column_type_sql: str
     # Whitelist validation to prevent SQL injection
     _ALLOWED_TABLES = {
         "product_items", "system_configs", "monitor_tasks",
-        "categories", "pending_imports"
+        "categories", "pending_imports", "report_outbox"
     }
     _ALLOWED_COLUMNS = {
         "product_items": {"url", "name", "price", "currency", "rating", "review_count",
-                         "availability", "last_updated", "task_id", "asin", "removed_at", "miss_count"},
+                         "availability", "last_updated", "task_id", "asin", "discovered_at", "removed_at",
+                         "miss_count", "is_new_discovery"},
         "system_configs": {"smtp_server", "smtp_host", "smtp_port", "smtp_user",
                           "sender_email", "sender_password", "smtp_password_enc",
+                          "backup_smtp_enabled", "backup_smtp_server", "backup_smtp_port",
+                          "backup_sender_email", "backup_sender_password",
                           "smtp_from_email", "smtp_to_emails", "product_retention_days",
-                          "setup_complete", "admin_password_enc", "proxy_url"},
+                          "setup_complete", "admin_password_enc", "proxy_url",
+                          "last_daily_report_at"},
         "monitor_tasks": {"name", "url", "max_pages", "category", "enabled",
                          "last_run_at", "last_status", "last_error", "consecutive_empty_count",
-                         "health_state", "last_health_alert_at", "last_recovery_at",
-                         "category_id", "task_type", "peak_product_count"},
+                         "consecutive_failure_count", "health_state", "last_health_alert_at",
+                         "last_recovery_at", "last_failure_at", "last_failure_reason",
+                         "manual_review_pending", "manual_review_kind", "manual_review_scope_key",
+                         "manual_review_scope_label", "manual_review_scope_kind", "manual_review_started_at",
+                         "category_id", "task_type", "integrity_reference_count", "peak_product_count",
+                         "sort_order"},
         "categories": {"name", "description"},
-        "pending_imports": {"source_db_path", "imported_at", "status"}
+        "pending_imports": {"source_db_path", "imported_at", "status"},
+        "report_outbox": {"next_attempt_at"},
     }
     _ALLOWED_COLUMN_TYPES = {
         "DATETIME",
@@ -205,6 +278,7 @@ def _ensure_column(conn, table_name: str, column_name: str, column_type_sql: str
         "INTEGER DEFAULT 0",
         "INTEGER DEFAULT 465",
         "VARCHAR DEFAULT 'healthy'",
+        "VARCHAR DEFAULT 'search'",
         "BOOLEAN DEFAULT 0",
         "VARCHAR",
         "INTEGER REFERENCES categories(id)",

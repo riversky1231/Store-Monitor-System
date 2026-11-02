@@ -13,6 +13,22 @@
     待分配 ({{ pending_imports|length }})
   </button>
   {% endif %}
+  {% if ordered_group_tasks|length > 1 %}
+  <button class="btn btn-ghost" onclick="openOrderModal()" title="拖动调整本分组全部店铺的顺序">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="15" height="15" aria-hidden="true">
+      <path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" stroke-linecap="round"/>
+    </svg>
+    调整顺序
+  </button>
+  {% endif %}
+  <form action="/tasks/group/{{ group.id }}/run" method="post" style="display:inline"
+        onsubmit="return confirm('确认执行当前分组下全部已启用任务？\n完成后会立即发送一封包含本分组全部商品链接的报告。')">
+    <input type="hidden" name="next" value="{{ current_path_query }}">
+    <button type="submit" class="btn" style="background:#0f766e;color:#fff">
+      <svg viewBox="0 0 24 24" fill="currentColor" width="15" height="15"><path d="M8 5v14l11-7z"/></svg>
+      执行本分组
+    </button>
+  </form>
   <button class="btn btn-primary" onclick="openM('addM')">
     <svg viewBox="0 0 24 24" fill="currentColor" width="15" height="15"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
     新增任务
@@ -23,10 +39,19 @@
 {% block content %}
 
 {% if request.query_params.get('run_started') %}
-<div class="alert alert-ok">任务已加入队列，即将运行。</div>
+<div class="alert alert-ok">任务已加入队列；运行完成后会发送一封包含全部商品链接的报告。</div>
 {% endif %}
 {% if request.query_params.get('already_running') %}
 <div class="alert alert-info">该任务正在执行中，请稍候。</div>
+{% endif %}
+{% if request.query_params.get('created') %}
+<div class="alert alert-ok">已新增监控任务。</div>
+{% endif %}
+{% if request.query_params.get('order_saved') %}
+<div class="alert alert-ok">店铺顺序已保存；列表、分组执行和报告生成都会采用该顺序。</div>
+{% endif %}
+{% if request.query_params.get('run_group') %}
+<div class="alert alert-ok">已将 {{ request.query_params.get('queued') | e }} 个任务加入当前分组执行队列；全部完成后会立即发送一封包含本分组全部商品链接的报告。</div>
 {% endif %}
 {% if request.query_params.get('import_ok') %}
 <div class="alert alert-ok">
@@ -41,8 +66,17 @@
 {% if request.query_params.get('batch_deleted') %}
 <div class="alert alert-ok">已批量删除 <strong>{{ request.query_params.get('batch_deleted') | e }}</strong> 个店铺。</div>
 {% endif %}
-{% if request.query_params.get('batch_updated') %}
-<div class="alert alert-ok">已将 <strong>{{ request.query_params.get('batch_updated') | e }}</strong> 个店铺的检查频率修改为 {{ request.query_params.get('new_interval') | e }} 小时。</div>
+{% if request.query_params.get('normalized') %}
+<div class="alert alert-ok">
+  已按当前抓取结果设为正常：新的可信基准为 <strong>{{ request.query_params.get('normalized_count') | e }}</strong> 个商品，
+  同步移除了 <strong>{{ request.query_params.get('normalized_removed') | e }}</strong> 个不在当前结果中的旧商品。
+</div>
+{% endif %}
+{% if request.query_params.get('review_cleared') %}
+<div class="alert alert-ok">已设为正常；任务仍保持手动执行模式。</div>
+{% endif %}
+{% if request.query_params.get('review_ignored') %}
+<div class="alert alert-ok">已忽略本次结果；保留上次运行记忆，任务已恢复待手动执行。</div>
 {% endif %}
 {% if request.query_params.get('claimed') %}
 <div class="alert alert-ok">已从待分配列表导入 <strong>{{ request.query_params.get('claimed') | e }}</strong> 个店铺到本分组。</div>
@@ -71,10 +105,6 @@
   <!-- Batch action bar — hidden until checkboxes are ticked -->
   <div id="batchBar" class="batch-bar" style="display:none">
     <span id="batchCount">已选 0 项</span>
-    <button class="btn btn-ghost" onclick="openBatchInterval()" style="font-size:13px">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      批量改频率
-    </button>
     <button class="btn btn-ghost" onclick="openBatchMove()" style="font-size:13px">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" stroke-linecap="round" stroke-linejoin="round"/></svg>
       移动到…
@@ -93,10 +123,9 @@
           <th style="width:36px"><input type="checkbox" id="checkAll" onchange="toggleAll(this)"></th>
           <th>任务名称</th>
           <th>监控地址</th>
-          <th>频率</th>
           <th>状态</th>
           <th>健康</th>
-          <th>下次执行</th>
+          <th>执行状态</th>
           <th>操作</th>
         </tr>
       </thead>
@@ -113,23 +142,49 @@
           <td class="td-url">
             <a href="{{ task.url }}" target="_blank" title="{{ task.url }}">{{ task.url }}</a>
           </td>
-          <td class="txt-m txt-s">每 {{ task.check_interval_hours }}h</td>
           <td>
             {% if task.is_active %}
-            <span class="badge b-on"><i></i>运行中</span>
+            <span class="badge b-on"><i></i>已启用</span>
             {% else %}
-            <span class="badge b-off"><i></i>已暂停</span>
+            <span class="badge b-off"><i></i>已关闭</span>
             {% endif %}
           </td>
           <td>
             {% if not task.is_active %}
             <span class="txt-m">—</span>
+            {% elif task.manual_review_pending %}
+            <span class="badge b-warn"><i></i>待人工确认</span>
+            {% if task.last_failure_reason %}
+            <div class="txt-m txt-s" style="margin-top:4px;max-width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="{{ task.last_failure_reason }}">{{ task.last_failure_reason }}</div>
+            {% endif %}
+            {% elif task.health_state == "failed" %}
+            <span class="badge b-alert"><i></i>失败 ({{ task.consecutive_failure_count or 0 }})</span>
+            {% if task.last_failure_reason %}
+            <div class="txt-m txt-s" style="margin-top:4px;max-width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="{{ task.last_failure_reason }}">{{ task.last_failure_reason }}</div>
+            {% endif %}
             {% elif task.health_state == "alert" %}
             <span class="badge b-alert"><i></i>告警 ({{ task.consecutive_empty_count }})</span>
             {% elif task.health_state == "warning" %}
+            {% if task.consecutive_failure_count %}
+            <span class="badge b-warn"><i></i>异常 ({{ task.consecutive_failure_count }})</span>
+            {% else %}
             <span class="badge b-warn"><i></i>{{ task.consecutive_empty_count }}/{{ empty_alert_threshold }}</span>
+            {% endif %}
             {% else %}
             <span class="badge b-ok"><i></i>正常</span>
+            {% endif %}
+            {% if task.pending_integrity_review %}
+            <div class="txt-m txt-s" style="margin-top:6px;max-width:220px" title="{{ task.pending_integrity_review.summary }}">
+              待人工确认：{{ task.pending_integrity_review.current_count }} / {{ task.pending_integrity_review.reference_count }}
+              ，阈值至少 {{ task.pending_integrity_review.min_required_count }}
+            </div>
+            {% endif %}
+            {% if task.manual_review_pending %}
+            <div class="txt-m txt-s" style="margin-top:6px">
+              请确认本次结果：正常 / 忽略 / 重试
+            </div>
+            {% elif task.health_state != "failed" and task.last_failure_reason %}
+            <div class="txt-m txt-s" style="margin-top:4px;max-width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="{{ task.last_failure_reason }}">{{ task.last_failure_reason }}</div>
             {% endif %}
           </td>
           <td class="txt-m txt-s">
@@ -140,17 +195,37 @@
               </svg>
               检索中…
             </span>
-            {% elif task.is_active and task.next_run_at %}
-            {{ task.next_run_at|beijing }}
-            {% else %}—{% endif %}
+            {% elif not task.is_active %}
+            已停用
+            {% elif task.manual_review_pending %}
+            待人工确认
+            {% else %}待手动执行{% endif %}
           </td>
           <td>
             <div class="acts">
+              {% if not task.manual_review_pending %}
               <form action="/tasks/{{ task.id }}/run" method="post" style="display:inline">
+                <input type="hidden" name="next" value="{{ current_path_query }}">
                 <button type="submit" class="ibt" title="立即运行">▶</button>
               </form>
+              {% endif %}
+              {% if task.manual_review_pending %}
+              <form action="/tasks/{{ task.id }}/accept-manual-review" method="post" style="display:inline">
+                <input type="hidden" name="next" value="{{ current_path_query }}">
+                <button type="submit" class="ibt" title="设为正常">✓</button>
+              </form>
+              <form action="/tasks/{{ task.id }}/ignore-manual-review" method="post" style="display:inline"
+                    onsubmit="return confirm('忽略「{{ task.name|e }}」本次结果？\\n会保留上次运行记忆，不把这次待确认结果作为新基线。')">
+                <input type="hidden" name="next" value="{{ current_path_query }}">
+                <button type="submit" class="ibt" title="忽略本次">⏭</button>
+              </form>
+              <form action="/tasks/{{ task.id }}/retry-manual-review" method="post" style="display:inline">
+                <input type="hidden" name="next" value="{{ current_path_query }}">
+                <button type="submit" class="ibt" title="重新执行">↻</button>
+              </form>
+              {% endif %}
               <button class="ibt" title="编辑"
-                onclick="openEdit({{ task.id }},'{{ task.name|e }}','{{ task.url|e }}','{{ task.selector|e }}',{{ task.check_interval_hours }},'{{ task.recipients|e }}',{{ 'true' if task.is_active else 'false' }},'{{ task.task_type or 'search' }}')">
+                onclick="openEdit({{ task.id }},'{{ task.name|e }}','{{ task.url|e }}','{{ task.selector|e }}','{{ task.recipients|e }}',{{ 'true' if task.is_active else 'false' }},'{{ task.task_type or 'search' }}')">
                 ✎
               </button>
               <button class="ibt" title="移动到其他分组"
@@ -158,10 +233,12 @@
                 ⇄
               </button>
               <form action="/tasks/{{ task.id }}/toggle" method="post" style="display:inline">
-                <button type="submit" class="ibt" title="{{ '暂停' if task.is_active else '启用' }}">⏸</button>
+                <input type="hidden" name="next" value="{{ current_path_query }}">
+                <button type="submit" class="ibt" title="{{ '停用任务' if task.is_active else '启用任务' }}">{{ '停' if task.is_active else '启' }}</button>
               </form>
               <form action="/tasks/{{ task.id }}/delete" method="post" style="display:inline"
                     onsubmit="return confirm('删除「{{ task.name|e }}」？')">
+                <input type="hidden" name="next" value="{{ current_path_query }}">
                 <button type="submit" class="ibt del" title="删除">✕</button>
               </form>
             </div>
@@ -169,7 +246,7 @@
         </tr>
         {% else %}
         <tr>
-          <td colspan="8" class="td-empty">
+          <td colspan="7" class="td-empty">
             {% if search %}没有找到名称包含「{{ search }}」的任务{% else %}暂无任务，点击右上角「新增任务」添加店铺{% endif %}
           </td>
         </tr>
@@ -203,6 +280,40 @@
   {% endif %}
 </div>
 
+{% if ordered_group_tasks|length > 1 %}
+<div id="orderM" class="overlay" role="dialog" aria-modal="true" aria-labelledby="orderTitle">
+  <div class="modal order-modal">
+    <div class="modal-hd">
+      <div>
+        <h3 id="orderTitle">调整店铺顺序</h3>
+        <p class="order-help">拖动店铺完成跨分页排序；也可以使用右侧箭头微调。</p>
+      </div>
+      <button class="modal-x" onclick="closeM('orderM')" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-bd">
+      <div id="orderList" class="order-list">
+        {% for ordered_task in ordered_group_tasks %}
+        <div class="order-item" draggable="true" data-task-id="{{ ordered_task.id }}">
+          <span class="order-grip" title="拖动排序" aria-hidden="true">⠿</span>
+          <span class="order-index">{{ loop.index }}</span>
+          <span class="order-name">{{ ordered_task.name }}</span>
+          <span class="order-actions">
+            <button type="button" class="order-arrow" onclick="moveOrderItem(this, -1)" aria-label="上移">↑</button>
+            <button type="button" class="order-arrow" onclick="moveOrderItem(this, 1)" aria-label="下移">↓</button>
+          </span>
+        </div>
+        {% endfor %}
+      </div>
+      <div id="orderStatus" class="order-status" role="status" aria-live="polite"></div>
+    </div>
+    <div class="modal-ft">
+      <button class="btn btn-ghost" onclick="closeM('orderM')">取消</button>
+      <button id="saveOrderBtn" class="btn btn-primary" onclick="saveTaskOrder()">保存顺序</button>
+    </div>
+  </div>
+</div>
+{% endif %}
+
 <!-- 新增任务 Modal -->
 <div id="addM" class="overlay">
   <div class="modal">
@@ -212,6 +323,7 @@
     </div>
     <div class="modal-bd">
       <form id="addF" action="/tasks/group/{{ group.id }}/add" method="post">
+        <input type="hidden" name="next_url" value="{{ current_path_query }}">
         <div class="form-blk">
           <label>任务名称</label>
           <input type="text" name="name" class="inp" placeholder="例：某某店铺上新监控" required>
@@ -233,17 +345,12 @@
           <input type="text" name="selector" id="a-sel" class="inp" value='div[data-component-type="s-search-result"]' required>
           <div class="hint">Amazon 搜索结果页使用默认值即可</div>
         </div>
-        <div class="form-row-2">
-          <div class="form-blk">
-            <label>检查频率（小时）</label>
-            <input type="number" name="check_interval_hours" class="inp" value="24" min="1" max="168" required>
-          </div>
-          <div class="form-blk" style="display:flex;align-items:flex-end;padding-bottom:2px">
-            <label class="check-row">
-              <input type="checkbox" name="is_active" value="true" checked>
-              创建后立即启用
-            </label>
-          </div>
+        <input type="hidden" name="check_interval_hours" value="24">
+        <div class="form-blk">
+          <label class="check-row">
+            <input type="checkbox" name="is_active" value="true" checked>
+            启用此任务（启用后仍需手动执行）
+          </label>
         </div>
         <div class="form-blk">
           <label>通知邮箱</label>
@@ -268,6 +375,7 @@
     </div>
     <div class="modal-bd">
       <form id="editF" method="post">
+        <input type="hidden" name="next_url" value="{{ current_path_query }}">
         <div class="form-blk">
           <label>任务名称</label>
           <input type="text" id="e-name" name="name" class="inp" required>
@@ -287,17 +395,12 @@
           <label>CSS 选择器</label>
           <input type="text" id="e-sel" name="selector" class="inp" required>
         </div>
-        <div class="form-row-2">
-          <div class="form-blk">
-            <label>检查频率（小时）</label>
-            <input type="number" id="e-hrs" name="check_interval_hours" class="inp" min="1" max="168" required>
-          </div>
-          <div class="form-blk" style="display:flex;align-items:flex-end;padding-bottom:2px">
-            <label class="check-row">
-              <input type="checkbox" id="e-act" name="is_active" value="true">
-              启用此任务
-            </label>
-          </div>
+        <input type="hidden" name="check_interval_hours" value="24">
+        <div class="form-blk">
+          <label class="check-row">
+            <input type="checkbox" id="e-act" name="is_active" value="true">
+            启用此任务（启用后仍需手动执行）
+          </label>
         </div>
         <div class="form-blk">
           <label>通知邮箱</label>
@@ -323,6 +426,7 @@
     <div class="modal-bd">
       <form id="moveF" method="post">
         <input type="hidden" name="source_group_id" value="{{ group.id }}">
+        <input type="hidden" name="return_to" value="{{ current_path_query }}">
         <div id="moveTaskInputs"></div>
         <div class="form-blk">
           <label>目标分组</label>
@@ -344,31 +448,6 @@
   </div>
 </div>
 
-<!-- 批量修改频率 Modal -->
-<div id="intervalM" class="overlay">
-  <div class="modal" style="max-width:420px">
-    <div class="modal-hd">
-      <h3>批量修改检查频率</h3>
-      <button class="modal-x" onclick="closeM('intervalM')">×</button>
-    </div>
-    <div class="modal-bd">
-      <form id="intervalF" method="post" action="/tasks/batch-update-interval">
-        <input type="hidden" name="source_group_id" value="{{ group.id }}">
-        <div id="intervalTaskInputs"></div>
-        <div class="form-blk">
-          <label>新的检查频率（小时）</label>
-          <input type="number" name="new_interval" class="inp" value="24" min="1" max="168" required>
-          <div class="hint">将所选任务的检查频率统一修改为此值</div>
-        </div>
-      </form>
-    </div>
-    <div class="modal-ft">
-      <button class="btn btn-ghost" onclick="closeM('intervalM')">取消</button>
-      <button class="btn btn-primary" onclick="document.getElementById('intervalF').submit()">确认修改</button>
-    </div>
-  </div>
-</div>
-
 <!-- 从待分配列表选择 Modal -->
 {% if pending_imports %}
 <div id="pendingM" class="overlay">
@@ -385,6 +464,7 @@
         <span id="pendingSel" style="font-size:12px;color:var(--text-sub)">已选 0 项</span>
       </div>
       <form id="pendingF" action="/tasks/group/{{ group.id }}/claim-pending" method="post">
+        <input type="hidden" name="return_to" value="{{ current_path_query }}">
         <div class="pending-list">
           {% for p in pending_imports %}
           <label class="pending-row">
@@ -416,17 +496,31 @@
 .batch-bar{display:flex;align-items:center;gap:10px;padding:8px 16px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;margin:0 0 -1px;font-size:13px;font-weight:600;color:#1d4ed8}
 .type-tag{display:inline-block;font-size:10px;font-weight:700;padding:1px 5px;border-radius:4px;vertical-align:middle;margin-left:4px}
 .type-tag.sf{background:#dbeafe;color:#1d4ed8}
+.order-modal{width:min(660px,100%)}
+.order-help{margin:4px 0 0;color:var(--text-sub);font-size:13px}
+.order-list{max-height:min(62vh,620px);overflow-y:auto;padding:4px;border:1px solid var(--border);border-radius:14px;background:#f7fbff}
+.order-item{display:grid;grid-template-columns:28px 34px minmax(0,1fr) auto;align-items:center;gap:8px;padding:10px 12px;margin:4px;background:#fff;border:1px solid #d8e8f4;border-radius:11px;box-shadow:0 2px 8px rgba(33,89,130,.06);cursor:grab;transition:transform .15s ease,border-color .15s ease,box-shadow .15s ease}
+.order-item:hover{border-color:#88bee3;box-shadow:0 5px 14px rgba(33,89,130,.11)}
+.order-item.dragging{opacity:.45;transform:scale(.985);border-color:#28a9ff;cursor:grabbing}
+.order-grip{font-size:21px;color:#6c9cbd;line-height:1}
+.order-index{display:grid;place-items:center;width:28px;height:28px;border-radius:9px;background:#eaf6ff;color:#147cbd;font-size:12px;font-weight:800}
+.order-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:700;color:var(--text-main)}
+.order-actions{display:flex;gap:5px}
+.order-arrow{width:30px;height:30px;border:1px solid #c9deed;border-radius:8px;background:#fff;color:#3a769d;cursor:pointer;font-weight:800}
+.order-arrow:hover:not(:disabled){background:#eaf6ff;border-color:#75b5df}
+.order-arrow:disabled{opacity:.3;cursor:not-allowed}
+.order-status{min-height:20px;margin-top:10px;font-size:13px;color:var(--text-sub)}
+.order-status.error{color:#c2413b}
 </style>
 
 <script>
 function openM(id)  { document.getElementById(id).classList.add('show'); }
 function closeM(id) { document.getElementById(id).classList.remove('show'); }
-function openEdit(id, name, url, sel, hrs, rec, active, taskType) {
+function openEdit(id, name, url, sel, rec, active, taskType) {
   document.getElementById('editF').action = '/tasks/' + id + '/edit';
   document.getElementById('e-name').value = name;
   document.getElementById('e-url').value  = url;
   document.getElementById('e-sel').value  = sel;
-  document.getElementById('e-hrs').value  = hrs;
   document.getElementById('e-rec').value  = rec;
   document.getElementById('e-act').checked = active;
   document.getElementById('e-type').value = taskType || 'search';
@@ -450,6 +544,79 @@ function onTypeChange(prefix) {
 document.querySelectorAll('.overlay').forEach(el =>
   el.addEventListener('click', e => { if (e.target === el) el.classList.remove('show'); })
 );
+
+/* --- Full-group drag ordering --- */
+let draggedOrderItem = null;
+function refreshOrderList() {
+  const items = Array.from(document.querySelectorAll('#orderList .order-item'));
+  items.forEach((item, index) => {
+    item.querySelector('.order-index').textContent = String(index + 1);
+    const arrows = item.querySelectorAll('.order-arrow');
+    arrows[0].disabled = index === 0;
+    arrows[1].disabled = index === items.length - 1;
+  });
+}
+function openOrderModal() {
+  refreshOrderList();
+  const status = document.getElementById('orderStatus');
+  status.textContent = '共 {{ ordered_group_tasks|length }} 个店铺，保存后立即生效。';
+  status.classList.remove('error');
+  openM('orderM');
+}
+function moveOrderItem(button, direction) {
+  const item = button.closest('.order-item');
+  const sibling = direction < 0 ? item.previousElementSibling : item.nextElementSibling;
+  if (!sibling) return;
+  if (direction < 0) item.parentNode.insertBefore(item, sibling);
+  else item.parentNode.insertBefore(sibling, item);
+  refreshOrderList();
+}
+document.querySelectorAll('#orderList .order-item').forEach(item => {
+  item.addEventListener('dragstart', event => {
+    draggedOrderItem = item;
+    item.classList.add('dragging');
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', item.dataset.taskId);
+  });
+  item.addEventListener('dragend', () => {
+    item.classList.remove('dragging');
+    draggedOrderItem = null;
+    refreshOrderList();
+  });
+  item.addEventListener('dragover', event => {
+    event.preventDefault();
+    if (!draggedOrderItem || draggedOrderItem === item) return;
+    const rect = item.getBoundingClientRect();
+    const insertAfter = event.clientY > rect.top + rect.height / 2;
+    item.parentNode.insertBefore(draggedOrderItem, insertAfter ? item.nextSibling : item);
+  });
+});
+async function saveTaskOrder() {
+  const button = document.getElementById('saveOrderBtn');
+  const status = document.getElementById('orderStatus');
+  const taskIds = Array.from(document.querySelectorAll('#orderList .order-item'))
+    .map(item => Number(item.dataset.taskId));
+  button.disabled = true;
+  status.textContent = '正在保存顺序…';
+  status.classList.remove('error');
+  try {
+    const response = await fetch('/tasks/group/{{ group.id }}/reorder', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({task_ids: taskIds})
+    });
+    if (!response.ok) throw new Error('保存失败（HTTP ' + response.status + '）');
+    const nextUrl = new URL(window.location.href);
+    nextUrl.searchParams.set('order_saved', '1');
+    nextUrl.searchParams.delete('highlight');
+    window.location.assign(nextUrl.toString());
+  } catch (error) {
+    status.textContent = error.message || '保存失败，请稍后重试。';
+    status.classList.add('error');
+    button.disabled = false;
+  }
+}
 
 /* --- Batch selection --- */
 function getCheckedIds() {
@@ -492,18 +659,6 @@ function openBatchMove() {
   _fillMoveInputs(ids);
   openM('moveM');
 }
-function openBatchInterval() {
-  const ids = getCheckedIds();
-  if (!ids.length) return;
-  const container = document.getElementById('intervalTaskInputs');
-  container.innerHTML = '';
-  ids.forEach(function(id) {
-    var inp = document.createElement('input');
-    inp.type = 'hidden'; inp.name = 'task_ids'; inp.value = id;
-    container.appendChild(inp);
-  });
-  openM('intervalM');
-}
 function openSingleMove(taskId, taskName) {
   document.getElementById('moveF').action = '/tasks/batch-move';
   document.getElementById('moveTitle').textContent = '移动「' + taskName + '」';
@@ -531,6 +686,9 @@ function submitBatchDelete() {
   const src = document.createElement('input');
   src.type = 'hidden'; src.name = 'source_group_id'; src.value = '{{ group.id }}';
   form.appendChild(src);
+  const back = document.createElement('input');
+  back.type = 'hidden'; back.name = 'return_to'; back.value = '{{ current_path_query }}';
+  form.appendChild(back);
   document.body.appendChild(form);
   form.submit();
 }

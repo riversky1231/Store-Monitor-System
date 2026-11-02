@@ -13,7 +13,7 @@
 <form action="/settings" method="post" class="settings-wrap">
 
   <div class="settings-section">
-    <div class="settings-section-head">SMTP 发件服务器</div>
+    <div class="settings-section-head">主 SMTP 发件服务器</div>
     <div class="settings-body">
       <div class="form-row-2">
         <div class="form-blk">
@@ -25,14 +25,17 @@
           <label>端口</label>
           <input type="number" name="smtp_port" class="inp"
                  value="{{ config.smtp_port }}" placeholder="465" required>
-          <div class="hint">SSL 加密使用 465</div>
+          <div class="hint">SSL 使用 465，STARTTLS 常用 587</div>
         </div>
       </div>
     </div>
   </div>
 
   <div class="settings-section">
-    <div class="settings-section-head">发件账号</div>
+    <div class="settings-section-head settings-head-row">
+      <span>主发件账号</span>
+      <button type="button" class="btn btn-ghost btn-xs" data-reveal-settings="primary">显示当前值 / 默认值</button>
+    </div>
     <div class="settings-body">
       <div class="form-blk">
         <label>发件邮箱</label>
@@ -41,7 +44,7 @@
       </div>
       <div class="form-blk">
         <label>邮箱授权码</label>
-        <input type="password" name="sender_password" class="inp"
+        <input type="password" name="sender_password" class="inp" autocomplete="new-password"
                placeholder="{{ '已保存，留空则不修改' if has_sender_password else '请输入授权码' }}">
         <div class="hint hint-warn">填写邮箱的「应用专用授权码」，不是登录密码</div>
       </div>
@@ -49,25 +52,53 @@
   </div>
 
   <div class="settings-section">
-    <div class="settings-section-head">网络代理 (可选)</div>
+    <div class="settings-section-head settings-head-row">
+      <span>备用 SMTP 发件服务器</span>
+      <button type="button" class="btn btn-ghost btn-xs" data-reveal-settings="backup">显示当前值 / 默认值</button>
+    </div>
     <div class="settings-body">
+      <label class="check-row" style="margin-bottom:12px">
+        <input type="checkbox" name="backup_smtp_enabled" value="true" {% if config.backup_smtp_enabled %}checked{% endif %}>
+        主 SMTP 发送失败后自动切换备用 SMTP
+      </label>
+      <div class="form-row-2">
+        <div class="form-blk">
+          <label>备用服务器地址</label>
+          <input type="text" name="backup_smtp_server" class="inp"
+                 value="{{ config.backup_smtp_server or '' }}" placeholder="smtp.gmail.com">
+        </div>
+        <div class="form-blk">
+          <label>备用端口</label>
+          <input type="number" name="backup_smtp_port" class="inp"
+                 value="{{ config.backup_smtp_port or 465 }}" placeholder="465">
+          <div class="hint">Gmail 可用 smtp.gmail.com:465 或 587</div>
+        </div>
+      </div>
       <div class="form-blk">
-        <label>代理地址</label>
-        <input type="text" name="proxy_url" class="inp"
-               value="{{ config.proxy_url or '' }}" placeholder="http://127.0.0.1:7890">
-        <div class="hint">支持 HTTP/HTTPS 代理，例如 http://user:pass@host:port</div>
+        <label>备用发件邮箱</label>
+        <input type="email" name="backup_sender_email" class="inp"
+               value="{{ config.backup_sender_email or '' }}" placeholder="your@gmail.com">
+      </div>
+      <div class="form-blk">
+        <label>备用邮箱授权码</label>
+        <input type="password" name="backup_sender_password" class="inp" autocomplete="new-password"
+               placeholder="{{ '已保存，留空则不修改' if has_backup_sender_password else '请输入备用授权码' }}">
+        <div class="hint hint-warn">Gmail 需要 Google 账号应用专用密码，QQ 需要 SMTP 授权码</div>
       </div>
     </div>
   </div>
 
   <div class="settings-section">
-    <div class="settings-section-head">数据保留</div>
+    <div class="settings-section-head settings-head-row">
+      <span>网络代理 (可选)</span>
+      <button type="button" class="btn btn-ghost btn-xs" data-reveal-settings="proxy">显示当前值 / 默认值</button>
+    </div>
     <div class="settings-body">
       <div class="form-blk">
-        <label>已下架商品保留天数</label>
-        <input type="number" name="product_retention_days" class="inp"
-               value="{{ config.product_retention_days or 90 }}" min="7" max="365" required>
-        <div class="hint">超过此天数的已下架商品记录将被自动清理</div>
+        <label>代理地址</label>
+        <input type="text" name="proxy_url" class="inp"
+               value="{{ config.proxy_url or '' }}" placeholder="http://proxy.example.com:7890">
+        <div class="hint">支持 HTTP/HTTPS 代理，例如 http://user:pass@host:port</div>
       </div>
     </div>
   </div>
@@ -77,5 +108,57 @@
   </div>
 
 </form>
+
+<script>
+(function() {
+  var buttons = document.querySelectorAll('[data-reveal-settings]');
+  buttons.forEach(function(button) {
+    button.addEventListener('click', function() {
+      var section = button.getAttribute('data-reveal-settings');
+      if (button.dataset.visible === 'true') {
+        document.querySelectorAll('input[type="text"][data-revealed-secret="' + section + '"]').forEach(function(input) {
+          input.type = 'password';
+          input.removeAttribute('data-revealed-secret');
+          input.value = '';
+        });
+        button.dataset.visible = 'false';
+        button.textContent = '显示当前值 / 默认值';
+        return;
+      }
+
+      button.disabled = true;
+      button.textContent = '读取中...';
+      fetch('/settings/reveal/' + encodeURIComponent(section), {
+        method: 'POST',
+        headers: {'Accept': 'application/json'},
+        cache: 'no-store'
+      }).then(function(response) {
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        return response.json();
+      }).then(function(payload) {
+        Object.keys(payload.values || {}).forEach(function(name) {
+          var input = document.querySelector('[name="' + name + '"]');
+          if (!input) return;
+          input.value = payload.values[name] == null ? '' : payload.values[name];
+          if (name.indexOf('password') !== -1 && input.value) {
+            input.type = 'text';
+            input.setAttribute('data-revealed-secret', section);
+          }
+        });
+        var revealedSecret = Object.keys(payload.values || {}).some(function(name) {
+          return name.indexOf('password') !== -1 && Boolean(payload.values[name]);
+        });
+        button.dataset.visible = revealedSecret ? 'true' : 'false';
+        button.textContent = revealedSecret ? '隐藏授权码' : (payload.summary || '已显示');
+        button.title = payload.summary || '';
+      }).catch(function() {
+        button.textContent = '读取失败，请重试';
+      }).finally(function() {
+        button.disabled = false;
+      });
+    });
+  });
+})();
+</script>
 
 {% endblock %}

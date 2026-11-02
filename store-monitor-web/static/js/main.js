@@ -121,9 +121,9 @@
   function renderNetworkAlertMeta(data) {
     const parts = [];
     if (data.state === "recovered") {
-      parts.push("系统已恢复自动重试");
+      parts.push("可继续人工处理");
     } else if (data.pending_count) {
-      parts.push("待重试任务 " + data.pending_count + " 个");
+      parts.push("待处理任务 " + data.pending_count + " 个");
     }
     if (Array.isArray(data.pending_preview) && data.pending_preview.length) {
       parts.push("涉及: " + data.pending_preview.join("、"));
@@ -161,7 +161,7 @@
     networkToast.classList.add(currentNetworkAlertState === "recovered" ? "is-recovered" : "is-issue");
     networkToastTitle.textContent = data.title || "抓取网络异常提醒";
     networkToastMessage.textContent = data.message || "检测到抓取网络或访问异常。";
-    networkToastDetail.textContent = data.detail || "建议检查当前网络、代理或出口节点后等待系统自动重试。";
+    networkToastDetail.textContent = data.detail || "建议检查当前网络、代理或出口节点后再人工决定是否重试。";
     networkToastMeta.textContent = renderNetworkAlertMeta(data);
     networkToast.hidden = false;
     window.requestAnimationFrame(() => {

@@ -1,10 +1,12 @@
 import concurrent.futures
+import getpass
 import ipaddress
 import logging
 import os
 import re
 import secrets
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -32,6 +34,20 @@ except ImportError:  # pragma: no cover - fallback to regex if library not insta
 
 logger = logging.getLogger(__name__)
 
+_SAFE_HTTP_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
+_CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; "
+    "base-uri 'self'; "
+    "form-action 'self'; "
+    "frame-ancestors 'none'; "
+    "object-src 'none'; "
+    "script-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+    "font-src 'self' https://fonts.gstatic.com data:; "
+    "img-src 'self' data: https:; "
+    "connect-src 'self'"
+)
+
 http_basic = HTTPBasic(auto_error=False)
 
 AUTH_DISABLE_ENV = "MONITOR_WEB_DISABLE_AUTH"
@@ -44,6 +60,7 @@ AUTH_RATE_LIMIT_MAX_CLIENTS_ENV = "MONITOR_WEB_AUTH_MAX_CLIENTS"
 URL_VALIDATION_CACHE_TTL_ENV = "MONITOR_WEB_URL_VALIDATION_CACHE_TTL_SECONDS"
 URL_VALIDATION_CACHE_MAX_ENTRIES_ENV = "MONITOR_WEB_URL_VALIDATION_CACHE_MAX_ENTRIES"
 DNS_LOOKUP_TIMEOUT_SECONDS_ENV = "MONITOR_WEB_DNS_TIMEOUT_SECONDS"
+ALLOW_PRIVATE_PROXY_ENV = "MONITOR_WEB_ALLOW_PRIVATE_PROXY"
 
 SMTP_SECRET_KEY_ENV = "STORE_MONITOR_SECRET_KEY"
 SMTP_SECRET_FILE_ENV = "STORE_MONITOR_SECRET_FILE"
@@ -66,6 +83,62 @@ def is_valid_email(email: str) -> bool:
         except EmailNotValidError:
             return False
     return bool(EMAIL_RE.fullmatch(email))
+
+
+def _normalized_origin(value: str) -> tuple[str, str, int | None] | None:
+    parsed = urlparse((value or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    port = parsed.port
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+    return parsed.scheme.lower(), parsed.hostname.lower().rstrip("."), port
+
+
+def is_trusted_write_request(request: Request) -> bool:
+    """Reject browser-originated cross-site writes while preserving CLI/API clients."""
+    if request.method.upper() in _SAFE_HTTP_METHODS:
+        return True
+
+    fetch_site = request.headers.get("sec-fetch-site", "").strip().lower()
+    if fetch_site == "cross-site":
+        return False
+
+    expected = _normalized_origin(str(request.base_url))
+    origin = request.headers.get("origin", "").strip()
+    if origin:
+        # Chromium can emit ``Origin: null`` for a normal local form submit
+        # (for example when a privacy extension strips the concrete origin).
+        # Sec-Fetch-Site is a browser-controlled forbidden header, so the
+        # same-origin value safely distinguishes this case from a cross-site
+        # opaque origin without disabling the CSRF guard.
+        if origin.lower() == "null":
+            return fetch_site == "same-origin"
+        return _normalized_origin(origin) == expected
+
+    referer = request.headers.get("referer", "").strip()
+    if referer:
+        return _normalized_origin(referer) == expected
+
+    # Non-browser clients commonly omit all browser origin metadata. They are
+    # still protected by HTTP Basic authentication.
+    return not fetch_site or fetch_site in {"none", "same-origin"}
+
+
+def security_response_headers(request: Request) -> dict[str, str]:
+    headers = {
+        "Content-Security-Policy": _CONTENT_SECURITY_POLICY,
+        "X-Frame-Options": "DENY",
+        "X-Content-Type-Options": "nosniff",
+        # Preserve a same-origin Referer as a fallback CSRF signal while never
+        # disclosing it to another origin.
+        "Referrer-Policy": "same-origin",
+        "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+        "Cross-Origin-Opener-Policy": "same-origin",
+    }
+    if (request.url.scheme or "").lower() == "https":
+        headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return headers
 
 _fernet_client = None
 _fernet_lock = threading.Lock()
@@ -294,7 +367,7 @@ def normalize_recipients(raw_value: str) -> str:
     return ", ".join(unique)
 
 
-def validate_monitor_target_url(raw_url: str) -> str:
+def validate_monitor_target_url(raw_url: str, *, force_dns_refresh: bool = False) -> str:
     candidate = (raw_url or "").strip()
     parsed = urlparse(candidate)
 
@@ -311,7 +384,37 @@ def validate_monitor_target_url(raw_url: str) -> str:
     if "." not in hostname:
         raise ValueError("Target host must be a public domain name.")
 
-    _ensure_public_host(hostname)
+    _ensure_public_host(hostname, force_refresh=force_dns_refresh)
+    return parsed.geturl()
+
+
+def validate_proxy_url(raw_url: str) -> str:
+    candidate = (raw_url or "").strip()
+    if not candidate:
+        return ""
+
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https", "socks5", "socks5h"}:
+        raise ValueError("Proxy URL must use http/https/socks5/socks5h.")
+    if not parsed.hostname:
+        raise ValueError("Proxy URL must contain a valid host.")
+
+    hostname = parsed.hostname.strip().lower().rstrip(".")
+    allow_private = os.getenv(ALLOW_PRIVATE_PROXY_ENV, "").strip().lower() in {"1", "true", "yes"}
+    if not allow_private:
+        if hostname == "localhost":
+            return parsed.geturl()
+        if hostname.endswith(".local"):
+            raise ValueError("Local/private proxy hosts are not allowed.")
+        literal_ip = _safe_parse_ip(hostname)
+        if literal_ip:
+            if literal_ip.is_loopback:
+                return parsed.geturl()
+            if _is_blocked_ip(literal_ip):
+                raise ValueError("Proxy host cannot be a private/loopback IP.")
+        else:
+            _ensure_public_host(hostname)
+
     return parsed.geturl()
 
 
@@ -352,8 +455,8 @@ def decrypt_secret(value: str) -> str:
         return ""
 
 
-def _ensure_public_host(hostname: str) -> None:
-    if _is_host_cached(hostname):
+def _ensure_public_host(hostname: str, *, force_refresh: bool = False) -> None:
+    if not force_refresh and _is_host_cached(hostname):
         return
     literal_ip = _safe_parse_ip(hostname)
     if literal_ip:
@@ -513,8 +616,40 @@ def _read_or_create_key_at(key_path: Path) -> bytes:
 def _write_key_file(key_path: Path, key_bytes: bytes) -> None:
     key_path.parent.mkdir(parents=True, exist_ok=True)
     key_path.write_bytes(key_bytes)
+    _tighten_key_file_permissions(key_path)
+
+
+def _tighten_key_file_permissions(key_path: Path) -> None:
+    if os.name == "nt":
+        _tighten_key_file_permissions_windows(key_path)
+        return
     try:
         os.chmod(key_path, 0o600)
-    except OSError:
-        # Permission tightening is best-effort on non-POSIX systems.
-        pass
+    except OSError as exc:
+        logger.warning("Failed to tighten secret-key file permissions for %s: %s", key_path, exc)
+
+
+def _tighten_key_file_permissions_windows(key_path: Path) -> None:
+    username = (
+        os.environ.get("USERNAME", "").strip()
+        or getpass.getuser().strip()
+        or None
+    )
+    if not username:
+        logger.warning("Unable to determine current Windows user for key-file ACL hardening: %s", key_path)
+        return
+    try:
+        subprocess.run(
+            [
+                "icacls",
+                str(key_path),
+                "/inheritance:r",
+                "/grant:r",
+                f"{username}:F",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:
+        logger.warning("Failed to harden Windows key-file ACL for %s: %s", key_path, exc)

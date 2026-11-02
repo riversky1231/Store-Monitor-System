@@ -33,7 +33,12 @@ dist/
 
 # Logs
 logs/*.log
+*.log
+*.log.[0-9]*
 !logs/.gitkeep
+
+# Local build output fragment
+store-monitor-web/ICO)
 
 # PM2
 .pm2/

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from logging.config import fileConfig
 
 from alembic import context
@@ -10,7 +11,10 @@ import models  # noqa: F401 - Ensure model metadata is registered.
 
 config = context.config
 
-if config.config_file_name is not None:
+# Only take over logging when running the alembic CLI standalone. When the
+# app invokes migrations programmatically (startup), fileConfig() would wipe
+# the app's root handlers — silently disabling monitor.log file logging.
+if config.config_file_name is not None and not logging.getLogger().handlers:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata

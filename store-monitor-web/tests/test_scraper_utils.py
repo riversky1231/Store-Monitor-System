@@ -4,19 +4,24 @@ from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
 from scraper import (
+    _attach_traffic_listeners,
     _browser_user_agent,
     _canonicalize_link,
     _discover_storefront_tabs_from_html,
     _extract_next_page_url,
+    _install_network_request_guard,
+    _navigate_with_retry,
     _normalize_delivery_text,
     _normalize_storefront_tab_url,
     _playwright_launch_env,
     _preferred_us_zip,
     _reload_after_delivery_update,
     _request_amazon_delivery_change,
+    _response_download_size,
     _storage_state_path,
     _title_from_amazon_product_link,
 )
+from traffic_metrics import TrafficCapture
 
 
 class CanonicalizeLinkTests(unittest.TestCase):
@@ -219,6 +224,141 @@ class ReloadAfterDeliveryUpdateTests(unittest.TestCase):
              patch("scraper._navigate_with_retry", return_value=True) as mock_nav:
             _reload_after_delivery_update(page, "https://www.amazon.com/s?me=A123", "10001")
         mock_nav.assert_called_once()
+
+
+class NavigateWithRetryTests(unittest.TestCase):
+    def test_rejects_unsafe_target_before_navigation(self):
+        page = MagicMock()
+
+        with patch("scraper._check_cancel"), \
+             patch("scraper.time.sleep"), \
+             patch("scraper.validate_monitor_target_url", side_effect=ValueError("private host")):
+            result = _navigate_with_retry(page, "http://127.0.0.1/internal", max_attempts=1)
+
+        self.assertFalse(result)
+        page.goto.assert_not_called()
+
+    def test_rejects_redirect_to_unsafe_final_url(self):
+        page = MagicMock()
+        page.url = "http://127.0.0.1/internal"
+
+        with patch("scraper._check_cancel"), \
+             patch("scraper.time.sleep"), \
+             patch(
+                 "scraper.validate_monitor_target_url",
+                 side_effect=["https://www.amazon.com/s?k=test", ValueError("private host")],
+             ):
+            result = _navigate_with_retry(page, "https://www.amazon.com/s?k=test", max_attempts=1)
+
+        self.assertFalse(result)
+        page.goto.assert_called_once()
+
+    def test_accepts_public_final_url(self):
+        page = MagicMock()
+        page.url = "https://www.amazon.com/s?k=test"
+
+        with patch("scraper._check_cancel"), \
+             patch("scraper.time.sleep"), \
+             patch("scraper._update_activity") as update_mock, \
+             patch("scraper.validate_monitor_target_url", return_value=page.url):
+            result = _navigate_with_retry(page, "https://www.amazon.com/s?k=test", max_attempts=1)
+
+        self.assertTrue(result)
+        update_mock.assert_called_once()
+
+
+class NetworkRequestGuardTests(unittest.TestCase):
+    def _handler(self):
+        context = MagicMock()
+        _install_network_request_guard(context)
+        context.route.assert_called_once_with("**/*", unittest.mock.ANY)
+        return context.route.call_args.args[1]
+
+    def test_private_redirect_request_is_aborted_before_continue(self):
+        handler = self._handler()
+        route = MagicMock()
+        route.request.url = "http://127.0.0.1/admin"
+        route.request.resource_type = "document"
+        route.request.is_navigation_request.return_value = True
+
+        with patch("scraper.validate_monitor_target_url", side_effect=ValueError("private")) as validate:
+            handler(route)
+
+        validate.assert_called_once_with(
+            "http://127.0.0.1/admin",
+            force_dns_refresh=True,
+        )
+        route.abort.assert_called_once_with("blockedbyclient")
+        route.continue_.assert_not_called()
+
+    def test_public_subresource_is_continued(self):
+        handler = self._handler()
+        route = MagicMock()
+        route.request.url = "https://images.example.com/product.jpg"
+        route.request.resource_type = "image"
+        route.request.is_navigation_request.return_value = False
+
+        with patch("scraper.validate_monitor_target_url", return_value=route.request.url) as validate:
+            handler(route)
+
+        validate.assert_called_once_with(route.request.url, force_dns_refresh=False)
+        route.continue_.assert_called_once_with()
+        route.abort.assert_not_called()
+
+
+class TrafficMetricsHookTests(unittest.TestCase):
+    def test_response_download_size_prefers_content_length(self):
+        response = MagicMock()
+        response.headers = {"content-length": "2048"}
+        response.request = MagicMock(resource_type="image")
+
+        size, measured = _response_download_size(response)
+
+        self.assertEqual(size, 2048)
+        self.assertTrue(measured)
+        response.body.assert_not_called()
+
+    def test_response_download_size_falls_back_to_body_for_text(self):
+        request = MagicMock()
+        request.resource_type = "document"
+        response = MagicMock()
+        response.headers = {"content-type": "text/html; charset=utf-8"}
+        response.request = request
+        response.body.return_value = b"<html>hello</html>"
+
+        size, measured = _response_download_size(response)
+
+        self.assertEqual(size, len(b"<html>hello</html>"))
+        self.assertTrue(measured)
+        response.body.assert_called_once()
+
+    def test_attach_traffic_listeners_records_request_and_response_bytes(self):
+        handlers = {}
+        capture = TrafficCapture(task_id=1, task_name="Task", task_url="https://example.com")
+
+        class DummyPage:
+            def on(self, event_name, handler):
+                handlers[event_name] = handler
+
+        request = MagicMock()
+        request.resource_type = "xhr"
+        request.post_data_buffer = b"payload"
+
+        response = MagicMock()
+        response.headers = {"content-length": "1024"}
+        response.request = request
+
+        with patch("scraper._current_traffic_capture", return_value=capture):
+            _attach_traffic_listeners(DummyPage())
+
+        handlers["request"](request)
+        handlers["response"](response)
+        snapshot = capture.snapshot()
+
+        self.assertEqual(snapshot["request_count"], 1)
+        self.assertEqual(snapshot["upload_bytes"], len(b"payload"))
+        self.assertEqual(snapshot["download_bytes"], 1024)
+        self.assertEqual(snapshot["resource_breakdown"][0]["type"], "xhr")
 
 
 if __name__ == "__main__":
