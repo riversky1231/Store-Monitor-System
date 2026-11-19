@@ -1083,3 +1083,54 @@ def test_resolving_review_cancels_failed_stale_reminder_before_final(session_fac
     finally:
         with scheduler_notifications._DIGEST_LOCK:
             scheduler_notifications._PENDING_DIGEST.clear()
+
+
+def test_late_failed_retry_keeps_complete_report_after_ignore_and_delivery_failure(session_factory):
+    scope_key = "group:46:run:late-retry"
+    with session_factory() as db:
+        group = Category(name="迟到重试分组")
+        db.add(group)
+        db.flush()
+        normal = _task("Normal Store", group.id)
+        retrying = _task("Ignored Store", group.id)
+        retrying.manual_review_pending = True
+        retrying.manual_review_scope_key = scope_key
+        db.add_all([normal, retrying])
+        db.commit()
+        retry_task_id = retrying.id
+        normal_entry = _report_entry(
+            normal, scope_key, status="success",
+            products=[{"name": "Kept", "link": "https://example.com/kept"}],
+        )
+        normal_entry["new_products"] = list(normal_entry["current_products"])
+        failed_entry = _report_entry(retrying, scope_key, status="failed")
+
+    with patch.object(scheduler_notifications, "_PENDING_DIGEST", [normal_entry, failed_entry]):
+        with patch("scheduler_notifications.send_manual_review_reminder", return_value=True):
+            scheduler_notifications.flush_digest(session_factory, only_scope_keys={scope_key})
+
+        with session_factory() as db:
+            db.get(MonitorTask, retry_task_id).manual_review_pending = False
+            db.commit()
+
+        with patch("scheduler_notifications.send_consolidated_email", return_value=False):
+            result = scheduler_notifications.resolve_held_report_task(
+                session_factory, scope_key, retry_task_id,
+                resolution_message="人工处理：已忽略本次结果",
+            )
+        assert result["released"] and not result["delivered"]
+
+        with session_factory() as db:
+            row = db.query(ReportOutbox).filter_by(scope_key=scope_key).one()
+            assert row.status == "failed"
+            original_payload = json.loads(row.payload_json)
+
+        scheduler_notifications._PENDING_DIGEST.append(failed_entry)
+        with patch("scheduler_notifications.send_consolidated_email", return_value=True) as send:
+            scheduler_notifications.flush_digest(session_factory, only_scope_keys={scope_key})
+
+        send.assert_called_once()
+        assert send.call_args.args[1] == original_payload
+        assert original_payload[0] == normal_entry
+        assert original_payload[1]["status"] == "confirmed"
+        assert original_payload[1]["status_message"] == "人工处理：已忽略本次结果"

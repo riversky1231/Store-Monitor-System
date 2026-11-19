@@ -758,8 +758,12 @@ def _deserialize_digest_entries(row: ReportOutbox) -> list[dict]:
     return payload
 
 
-def _merge_digest_entries(existing: list[dict], replacements: list[dict]) -> list[dict]:
-    """Replace task outcomes without dropping the other stores in a held group."""
+def _merge_digest_entries(
+    existing: list[dict],
+    replacements: list[dict],
+    pending_task_ids: set[int],
+) -> list[dict]:
+    """Update one batch without dropping other stores or undoing manual decisions."""
     replacement_by_task = {
         int(entry["task_id"]): entry
         for entry in replacements
@@ -771,7 +775,16 @@ def _merge_digest_entries(existing: list[dict], replacements: list[dict]) -> lis
         task_id = entry.get("task_id")
         normalized_id = int(task_id) if task_id is not None else None
         if normalized_id is not None and normalized_id in replacement_by_task:
-            merged.append(replacement_by_task[normalized_id])
+            replacement = replacement_by_task[normalized_id]
+            if (
+                entry.get("status") == "confirmed"
+                and replacement.get("status") == "failed"
+                and normalized_id not in pending_task_ids
+            ):
+                # A queued retry can arrive after the user has already handled it.
+                merged.append(entry)
+            else:
+                merged.append(replacement)
             seen_task_ids.add(normalized_id)
         else:
             merged.append(entry)
@@ -789,12 +802,13 @@ def _upsert_outbox_report(
     db: Session,
     scope_entries: list[dict],
     *,
-    hold_for_review: bool = False,
+    pending_task_ids: set[int],
 ) -> ReportOutbox:
     scope_key = (scope_entries[0].get("scope_key") or "").strip()
     if not scope_key:
         raise ValueError("Report scope key is required for durable delivery.")
 
+    hold_for_review = bool(pending_task_ids)
     row = db.query(ReportOutbox).filter(ReportOutbox.scope_key == scope_key).first()
     if row is None:
         row = ReportOutbox(
@@ -809,9 +823,11 @@ def _upsert_outbox_report(
     elif row.status != "sent":
         row.scope_label = (scope_entries[0].get("scope_label") or row.scope_label or "").strip()
         row.scope_kind = (scope_entries[0].get("scope_kind") or row.scope_kind or "group").strip()
-        if row.status == _OUTBOX_HELD_STATUS:
+        # A review can release the report while retry entries are still queued.
+        # Merge into the original snapshot even after a delivery attempt failed.
+        if row.payload_json != "[]":
             existing_entries = _deserialize_digest_entries(row)
-            scope_entries = _merge_digest_entries(existing_entries, scope_entries)
+            scope_entries = _merge_digest_entries(existing_entries, scope_entries, pending_task_ids)
         row.payload_json = _serialize_digest_entries(scope_entries)
         row.status = _OUTBOX_HELD_STATUS if hold_for_review else "pending"
         row.last_error = None
@@ -1238,7 +1254,7 @@ def flush_digest(
                     row = _upsert_outbox_report(
                         db,
                         scope_entries,
-                        hold_for_review=bool(pending_tasks),
+                        pending_task_ids={task.id for task in pending_tasks},
                     )
                 except Exception as exc:
                     db.rollback()
